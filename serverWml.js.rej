@@ -1,0 +1,19 @@
+diff a/serverWml.js b/serverWml.js	(rejected hunks)
+@@ -6109,13 +6109,13 @@
+           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+           <span class="btn-lbl">Invia normale<span class="btn-sub">Upload diretto, un\'unica richiesta</span></span>
+         </button>
+-        <button type="button" class="btn-s" onclick="uploadChunked(this,1,32768)">
++        <button type="button" class="btn-s" onclick="uploadChunked(this,1,16384)">
+           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg>
+-          <span class="btn-lbl">Sequenziale<span class="btn-sub">Chunk da 32 KB uno alla volta</span></span>
++          <span class="btn-lbl">Sequenziale<span class="btn-sub">Chunk da 16 KB uno alla volta</span></span>
+         </button>
+-        <button type="button" class="btn-p" onclick="uploadChunked(this,3,32768)">
++        <button type="button" class="btn-p" onclick="uploadChunked(this,3,16384)">
+           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+-          <span class="btn-lbl">Parallelo &times;4<span class="btn-sub">3 chunk da 32 KB simultanei</span></span>
++          <span class="btn-lbl">Parallelo &times;4<span class="btn-sub">3 chunk da 16 KB simultanei</span></span>
+         </button>
+       </div>
+       <div class="prog"><div class="prog-bar"><div class="prog-fill"></div><div class="prog-lbl">0%</div></div><div class="prog-msg">Avvio...</div></div>

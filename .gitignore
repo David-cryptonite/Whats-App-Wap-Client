@@ -1,0 +1,63 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# WhatsApp Authentication & Data
+auth_info_baileys/
+data/
+auth.db
+auth.db-shm
+auth.db-wal
+sessions.db
+sessions.db-shm
+sessions.db-wal
+
+# Media & stickers cache
+media_cache/
+stickers/
+
+# TLS certificates
+certs/
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+logs/
+app.log
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Downloads
+downloads/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+tmp/
+temp/
+
+# Video frame cache
+video_frames_cache/
