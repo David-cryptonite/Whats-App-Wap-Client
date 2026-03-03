@@ -271,6 +271,4 @@ Change language from the phone: **Settings > UI Language**.
 
 To add a new language, copy `locales/en.json`, translate all values, and save as `locales/<code>.json`.
 
-## License
 
-ISC
