@@ -722,6 +722,7 @@
 
   "opera": {
     "page_title": "Invia Media",
+    "wap1_unsupported": "L'invio di foto, video e file non è supportato dal browser di questo dispositivo. I telefoni WML 1.0 non hanno un selettore di file. Usa un telefono più recente o un browser moderno per inviare media; i messaggi di testo funzionano comunque.",
     "to": "A:",
     "image": "Immagine",
     "audio": "Audio",

@@ -38,9 +38,9 @@ class PersistentStorage {
       if (fs.existsSync(this.contactsFile)) {
         const contactsData = JSON.parse(fs.readFileSync(this.contactsFile, 'utf8'))
 
-        // Separate JID and LID contacts
-        const jidContacts = contactsData.filter(([key]) => !key.startsWith('lid:'))
-        const lidContacts = contactsData.filter(([key]) => key.startsWith('lid:'))
+        // Separate JID and LID contacts (LIDs are "<digits>@lid", not "lid:"-prefixed)
+        const jidContacts = contactsData.filter(([key]) => !key.endsWith('@lid'))
+        const lidContacts = contactsData.filter(([key]) => key.endsWith('@lid'))
 
         // Load JID contacts first, then LID contacts
         result.contacts = new Map([...jidContacts, ...lidContacts])
@@ -52,9 +52,9 @@ class PersistentStorage {
       if (fs.existsSync(this.chatsFile)) {
         const chatsData = JSON.parse(fs.readFileSync(this.chatsFile, 'utf8'))
 
-        // Separate JID and LID chats
-        const jidChats = chatsData.filter(([key]) => !key.startsWith('lid:'))
-        const lidChats = chatsData.filter(([key]) => key.startsWith('lid:'))
+        // Separate JID and LID chats (LIDs are "<digits>@lid", not "lid:"-prefixed)
+        const jidChats = chatsData.filter(([key]) => !key.endsWith('@lid'))
+        const lidChats = chatsData.filter(([key]) => key.endsWith('@lid'))
 
         // Load JID chats first, then LID chats
         result.chats = new Map([...jidChats, ...lidChats].map(([key, messages]) => [key, messages]))

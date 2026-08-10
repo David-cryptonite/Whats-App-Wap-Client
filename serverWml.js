@@ -38,6 +38,7 @@ import ffmpeg from 'ffmpeg-static';
 import { exec, spawn } from 'child_process';
 import iconv from 'iconv-lite';
 import net from 'net';
+import dns from 'dns';
 import dgram from 'dgram';
 import Busboy from 'busboy';
 
@@ -90,7 +91,7 @@ const existingPw = authDb.prepare('SELECT value FROM config WHERE key = ?').get(
 if (!existingPw) {
   const defaultHash = bcrypt.hashSync('admin', 10);
   authDb.prepare('INSERT INTO config (key, value) VALUES (?, ?)').run('password_hash', defaultHash);
-  console.log('[AUTH] Default password set to "" — change it from settings!');
+  console.log('[AUTH] Default password set to "admin" — change it from settings immediately!');
 }
 const existingUser = authDb.prepare('SELECT value FROM config WHERE key = ?').get('username');
 if (!existingUser) {
@@ -199,10 +200,14 @@ class RTSPServer {
 
   handleOptions(socket, cseq) {
     console.log(`[RTSP] OPTIONS request, CSeq=${cseq}`);
+    // PAUSE is deliberately not advertised: correct pause/resume requires either
+    // RTP-timestamp-continuous resumption or POSIX SIGSTOP/SIGCONT on the ffmpeg
+    // process, which isn't reliably supported cross-platform (Windows in particular)
+    // — advertising it and silently misbehaving would be worse than not offering it.
     const response = `RTSP/1.0 200 OK\r\n` +
       `CSeq: ${cseq}\r\n` +
       `Server: WhatsApp-WAP-RTSP/1.0\r\n` +
-      `Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n` +
+      `Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n` +
       `\r\n`;
     socket.write(response);
     console.log(`[RTSP] OPTIONS response sent`);
@@ -388,6 +393,15 @@ class RTSPServer {
       `\r\n`;
 
     socket.write(response);
+
+    // A repeat PLAY on an already-playing session (some RTSP stacks resend
+    // control requests) would otherwise spawn a second ffmpeg process that
+    // overwrites the first one's map entry, orphaning it with no teardown path.
+    const existingProcess = this.ffmpegProcesses.get(sessionId);
+    if (existingProcess) {
+      existingProcess.kill('SIGTERM');
+      this.ffmpegProcesses.delete(sessionId);
+    }
 
     // Start streaming with ffmpeg — fire-and-forget but capture errors
     this.startStreaming(session, sessionId).catch(err =>
@@ -604,8 +618,6 @@ axios.defaults.maxRedirects = 5;
 // Configurazione Whisper e TTS
 let transcriber = null;
 let transcriptionEnabled = false;
-let ttsModel = null;
-let ttsSpeakerEmbeddings = null;
 let ttsEnabled = false;
 
 // Inizializza il modello Whisper con import dinamico
@@ -811,6 +823,66 @@ function safeTempPath(filename) {
     fs.mkdirSync(dir, { recursive: true });
   }
   return fullPath;
+}
+
+// ============ SAFE REMOTE MEDIA FETCH (SSRF guard) ============
+// Every "send media from URL" route downloads a user-supplied URL server-side.
+// Without host validation, that's an SSRF primitive against internal services
+// (metadata endpoints, internal admin panels, etc). This resolves the hostname,
+// rejects private/loopback/link-local addresses, and pins the connection to the
+// validated address (via axios' `lookup` option) so a malicious DNS response
+// received between our check and the actual request (DNS rebinding) can't
+// redirect the connection elsewhere.
+function isDisallowedIp(ip) {
+  const version = net.isIP(ip);
+  if (version === 4) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 127 || a === 10 || a === 0 || a >= 224) return true; // loopback / private / "this network" / multicast+reserved
+    if (a === 172 && b >= 16 && b <= 31) return true; // private
+    if (a === 192 && b === 168) return true; // private
+    if (a === 169 && b === 254) return true; // link-local, incl. cloud metadata (169.254.169.254)
+    return false;
+  }
+  if (version === 6) {
+    const low = ip.toLowerCase();
+    if (low === '::1' || low === '::') return true; // loopback / unspecified
+    if (/^fe[89ab][0-9a-f]:/.test(low)) return true; // link-local fe80::/10
+    if (/^f[cd][0-9a-f]{2}:/.test(low)) return true; // unique local fc00::/7
+    const v4Mapped = low.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (v4Mapped) return isDisallowedIp(v4Mapped[1]);
+    return false;
+  }
+  return true; // couldn't parse — reject to be safe
+}
+
+async function safeFetchUrl(rawUrl, { timeoutMs = 60000, maxBytes = 50 * 1024 * 1024 } = {}) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error('Invalid URL');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only http/https URLs are allowed');
+  }
+
+  const addresses = await dns.promises.lookup(parsed.hostname, { all: true, verbatim: true });
+  if (!addresses.length) throw new Error('Could not resolve host');
+  for (const { address } of addresses) {
+    if (isDisallowedIp(address)) {
+      throw new Error('This URL points to a disallowed address');
+    }
+  }
+
+  const pinned = addresses[0];
+  return axios.get(rawUrl, {
+    responseType: 'arraybuffer',
+    timeout: timeoutMs,
+    maxContentLength: maxBytes,
+    maxBodyLength: maxBytes,
+    maxRedirects: 0, // a redirect could point at an internal address our check never saw
+    lookup: (_hostname, _options, callback) => callback(null, pinned.address, pinned.family),
+  });
 }
 
 // ============ MEDIA PRE-CONVERSION CACHE (for Symbian) ============
@@ -1348,116 +1420,6 @@ async function textToSpeechLocal(text, language = 'en') {
   }
 }
 
-// Google TTS (for non-English languages or fallback)
-async function textToSpeechGoogle(text, language = 'en') {
-  try {
-    // Google Translate TTS API endpoint
-    const ttsUrl = `https://translate.google.com/translate_tts`;
-
-    // Split text into chunks if longer than 200 characters (Google TTS limit)
-    const maxLength = 200;
-    const chunks = [];
-
-    if (text.length <= maxLength) {
-      chunks.push(text);
-    } else {
-      // Split by sentences
-      const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-      let currentChunk = '';
-
-      for (const sentence of sentences) {
-        if ((currentChunk + sentence).length <= maxLength) {
-          currentChunk += sentence;
-        } else {
-          if (currentChunk) chunks.push(currentChunk.trim());
-          currentChunk = sentence;
-        }
-      }
-      if (currentChunk) chunks.push(currentChunk.trim());
-    }
-
-    console.log(`Split into ${chunks.length} chunk(s) for Google TTS`);
-
-    // Fetch audio for each chunk
-    const audioBuffers = [];
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      console.log(`Fetching Google TTS audio for chunk ${i + 1}/${chunks.length}`);
-
-      const response = await axios.get(ttsUrl, {
-        params: {
-          ie: 'UTF-8',
-          tl: language,
-          client: 'tw-ob',
-          q: chunk,
-          textlen: chunk.length
-        },
-        responseType: 'arraybuffer',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Referer': 'https://translate.google.com/'
-        },
-        timeout: 30000, // 30 second timeout
-        maxContentLength: 10 * 1024 * 1024, // 10MB max
-        maxBodyLength: 10 * 1024 * 1024
-      });
-
-      audioBuffers.push(Buffer.from(response.data));
-    }
-
-    // Concatenate audio buffers if multiple chunks
-    if (audioBuffers.length === 1) {
-      return audioBuffers[0];
-    } else {
-      // Simple concatenation works for MP3 files
-      return Buffer.concat(audioBuffers);
-    }
-  } catch (error) {
-    console.error('Google TTS error:', error.message);
-    throw error;
-  }
-}
-
-// Helper function to convert Float32Array audio to WAV buffer
-async function convertToWav(audioData, samplingRate = 16000) {
-  // Create WAV header
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const byteRate = samplingRate * numChannels * bitsPerSample / 8;
-  const blockAlign = numChannels * bitsPerSample / 8;
-  const dataSize = audioData.length * 2; // 16-bit = 2 bytes per sample
-
-  const buffer = Buffer.alloc(44 + dataSize);
-
-  // RIFF header
-  buffer.write('RIFF', 0);
-  buffer.writeUInt32LE(36 + dataSize, 4);
-  buffer.write('WAVE', 8);
-
-  // fmt chunk
-  buffer.write('fmt ', 12);
-  buffer.writeUInt32LE(16, 16); // fmt chunk size
-  buffer.writeUInt16LE(1, 20); // audio format (1 = PCM)
-  buffer.writeUInt16LE(numChannels, 22);
-  buffer.writeUInt32LE(samplingRate, 24);
-  buffer.writeUInt32LE(byteRate, 28);
-  buffer.writeUInt16LE(blockAlign, 32);
-  buffer.writeUInt16LE(bitsPerSample, 34);
-
-  // data chunk
-  buffer.write('data', 36);
-  buffer.writeUInt32LE(dataSize, 40);
-
-  // Convert float32 to int16
-  for (let i = 0; i < audioData.length; i++) {
-    const sample = Math.max(-1, Math.min(1, audioData[i]));
-    const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-    buffer.writeInt16LE(int16, 44 + i * 2);
-  }
-
-  return buffer;
-}
-
 // ============ WAP PUSH NOTIFICATION HELPER ============
 /**
  * Sends a WAP Push notification to the specified phone number
@@ -1471,13 +1433,21 @@ async function sendWAPPushNotification(phoneNumber, text, wmlPath, siAction = 's
   try {
     const WAP_PUSH_BASE_URL = process.env.WAP_PUSH_BASE_URL || '';
     if (!WAP_PUSH_BASE_URL) { logger.warn('WAP_PUSH_BASE_URL not configured — skipping WAP Push'); return false; }
-    // WAP_SERVER_BASE must be the public URL reachable by the phone (not 127.0.0.1)
+    // WAP_SERVER_BASE must be the public URL reachable by the phone (not 127.0.0.1) —
+    // unlike WAP_PUSH_BASE_URL above, a missing value used to fall back silently to
+    // a loopback address the phone can never reach, so every push "succeeded" while
+    // actually linking nowhere. Warn loudly instead of failing silently.
+    if (!process.env.WAP_SERVER_BASE) {
+      logger.warn('WAP_SERVER_BASE not configured — WAP Push links will use ' +
+        (HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1') +
+        ', which the recipient phone likely cannot reach. Set WAP_SERVER_BASE to your public URL.');
+    }
     const WAP_SERVER_BASE = process.env.WAP_SERVER_BASE
       || `${HTTPS_ENABLED ? 'https' : 'http'}://${HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1'}:${HTTPS_ENABLED ? HTTPS_PORT : port}`;
     const AUTH = process.env.WAP_PUSH_AUTH || '';
 
     const fullWMLURL = `${WAP_SERVER_BASE}${wmlPath}`;
-    const truncatedText = text.length > 100 ? text.substring(0, 97) + '...' : text;
+    const truncatedText = text.length > 100 ? safeSlice(text, 97) + '...' : text;
 
     // Genera WAPSIID univoco
     const wapsiid = generateWAPSIID();
@@ -1561,9 +1531,14 @@ async function sendWAPDelete(phoneNumber, wapsiid) {
     const WAP_PUSH_BASE_URL = process.env.WAP_PUSH_BASE_URL || '';
     if (!WAP_PUSH_BASE_URL) { logger.warn('WAP_PUSH_BASE_URL not configured — skipping WAP Push delete'); return false; }
     const AUTH = process.env.WAP_PUSH_AUTH || '';
+    if (!process.env.WAP_SERVER_BASE) {
+      logger.warn('WAP_SERVER_BASE not configured — WAP Push delete URL will use ' +
+        (HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1') +
+        ', which the recipient phone likely cannot reach. Set WAP_SERVER_BASE to your public URL.');
+    }
 
     const params = new URLSearchParams({
-  
+
       PhoneNumber: phoneNumber,
       WAPURL: process.env.WAP_SERVER_BASE || `${HTTPS_ENABLED ? 'https' : 'http'}://${HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1'}:${HTTPS_ENABLED ? HTTPS_PORT : port}`,
       Text: 'Delete Notification',   // Testo vuoto per delete
@@ -1670,46 +1645,6 @@ async function unlinkSilent(filePath) {
   try { await fs.promises.unlink(filePath); } catch { /* ignore */ }
 }
 
-// Helper function to concatenate multiple audio files using FFmpeg
-async function concatenateAudioFiles(audioBuffers) {
-  const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const tempFiles = [];
-  const tempOutput = safeTempPath(`concat_out_${id}.wav`);
-  const concatList = safeTempPath(`concat_list_${id}.txt`);
-
-  try {
-    for (let i = 0; i < audioBuffers.length; i++) {
-      const tempFile = safeTempPath(`concat_chunk_${id}_${i}.wav`);
-      await fs.promises.writeFile(tempFile, audioBuffers[i]);
-      tempFiles.push(tempFile);
-    }
-
-    const listContent = tempFiles.map(f => `file '${f}'`).join('\n');
-    await fs.promises.writeFile(concatList, listContent);
-
-    await new Promise((resolve, reject) => {
-      const proc = spawn(ffmpeg, ['-f', 'concat', '-safe', '0', '-i', concatList, '-c', 'copy', '-y', tempOutput]);
-      let stderr = '';
-      proc.stderr.on('data', d => { stderr += d.toString(); });
-      proc.on('error', reject);
-      proc.on('close', code => code === 0 ? resolve() : reject(new Error(`FFmpeg concat failed (${code}): ${stderr.slice(-200)}`)));
-    });
-
-    let concatenated;
-    try {
-      concatenated = await fs.promises.readFile(tempOutput);
-    } catch (e) {
-      throw new Error(`FFmpeg concat produced no output: ${e.message}`);
-    }
-    return concatenated;
-  } catch (error) {
-    console.error('Audio concatenation error:', error.message);
-    throw error;
-  } finally {
-    for (const f of [...tempFiles, concatList, tempOutput]) unlinkSilent(f);
-  }
-}
-
 // Helper function to convert WAV to OGG Opus format
 async function convertWavToOgg(wavBuffer) {
   const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -1769,20 +1704,56 @@ const HTTPS_CERTS_DIR = process.env.HTTPS_CERTS_DIR || path.join(dirname(fileURL
 const WA_PHONE_NUMBER = (process.env.WA_PHONE_NUMBER || '').replace(/\D/g, '');
 const AUTH_ENABLED = !['0', 'false', 'no', 'off'].includes((process.env.AUTH_ENABLED || 'true').toLowerCase());
 // WAP Push is now controlled via userSettings.wapPushEnabled (runtime toggle from settings page)
-const MARKUP_MODE = (() => {
-  const m = (process.env.MARKUP_MODE || 'wml').toLowerCase();
+// If MARKUP_MODE is explicitly set, every request is forced to that single tier
+// (useful for a dedicated single-tier deployment, or debugging one tier at a time).
+// If left unset (the default), detectTier() below picks the right tier PER REQUEST
+// from the User-Agent, so one running server can genuinely serve the whole device
+// spectrum this app targets — WAP 1.0 WML phones, WAP 2.0/XHTML-MP phones, and
+// modern HTML5 browsers — instead of requiring one deployment per tier.
+const MARKUP_MODE_EXPLICIT = (() => {
+  if (!process.env.MARKUP_MODE) return null;
+  const m = process.env.MARKUP_MODE.toLowerCase();
   if (['wml', 'xhtml', 'html5'].includes(m)) return m;
-  console.warn(`[env] Invalid MARKUP_MODE="${process.env.MARKUP_MODE}", falling back to "wml"`);
-  return 'wml';
+  console.warn(`[env] Invalid MARKUP_MODE="${process.env.MARKUP_MODE}", falling back to auto-detection`);
+  return null;
 })();
-const UPLOAD_MARKUP_MODE = (() => {
-  const m = (process.env.UPLOAD_MARKUP_MODE || '').toLowerCase();
-  if (['wml', 'xhtml', 'html5'].includes(m)) return m;
-  // Default: follow MARKUP_MODE when not explicitly set
-  if (!process.env.UPLOAD_MARKUP_MODE) return MARKUP_MODE === 'html5' ? 'html5' : MARKUP_MODE;
-  console.warn(`[env] Invalid UPLOAD_MARKUP_MODE="${process.env.UPLOAD_MARKUP_MODE}", falling back to MARKUP_MODE`);
-  return MARKUP_MODE;
-})();
+// Base/fallback tier used wherever a request isn't available to detect from
+// (e.g. code that runs outside a request handler).
+const MARKUP_MODE = MARKUP_MODE_EXPLICIT || 'wml';
+
+// Detects which markup tier a specific request's device actually supports.
+// Reused for both page rendering (sendWml/sendRawWmlAware) and the /opera/*
+// upload flow — previously those were two independently-configured knobs
+// (MARKUP_MODE / UPLOAD_MARKUP_MODE) that could disagree on the same device.
+function detectTier(req) {
+  if (MARKUP_MODE_EXPLICIT) return MARKUP_MODE_EXPLICIT;
+
+  const ua = (req?.headers?.['user-agent'] || '').toLowerCase();
+  if (!ua) return 'wml'; // no UA at all — assume the least capable client
+
+  // Opera Mini renders pages server-side on Opera's infrastructure and forwards an
+  // already-rendered, modern result to the handset — true even on old Symbian/S60
+  // hardware — so it always gets the full HTML5 experience.
+  if (ua.includes('opera mini') || ua.includes('opera mobi')) return 'html5';
+
+  // WAP 1.0 era: WML-only microbrowsers — no CSS, no JS, numeric-keypad navigation only.
+  if (
+    ua.includes('up.browser') || ua.includes('openwave') || ua.includes('series40') ||
+    ua.includes('mot-') || ua.includes('sie-') || ua.includes('sam-') || ua.includes('sec-') ||
+    ua.includes('wapalizer') || ua.includes('maui') ||
+    (ua.includes('nokia') && !ua.includes('series60'))
+  ) return 'wml';
+
+  // WAP 2.0 / XHTML-MP era: native Symbian S60 browser, BlackBerry OS <6, Windows Mobile,
+  // generic MIDP/J2ME feature-phone browsers — support basic CSS and XHTML but not modern JS.
+  if (
+    ua.includes('series60') || ua.includes('symbianos') || ua.includes('blackberry') ||
+    ua.includes('windows ce') || ua.includes('midp') || ua.includes('j2me') || ua.includes('obigo')
+  ) return 'xhtml';
+
+  // Everything else: modern desktop/mobile browsers get the full HTML5 experience.
+  return 'html5';
+}
 let sock = null;
 
 // ============ PRODUCTION-GRADE PERFORMANCE MONITORING ============
@@ -1862,6 +1833,14 @@ app.use((req, res, next) => {
   next();
 });
 
+// 0. DEVICE TIER DETECTION — resolved once per request, read by sendWml()/sendRawWmlAware()
+// and the /opera/* upload routes so every response matches what the requesting device
+// (WAP 1.0 / WAP 2.0-XHTML-MP / modern HTML5) can actually render.
+app.use((req, res, next) => {
+  res.locals.tier = detectTier(req);
+  next();
+});
+
 // 1. COMPRESSION - Gzip/Brotli for 70-90% size reduction
 app.use(compression({
   level: 6, // Balance between speed and compression
@@ -1933,8 +1912,19 @@ const wmlLimiter = rateLimit({
   legacyHeaders: false
 });
 
+// Login is outside /api and /wml, so it needs its own (stricter) limiter to prevent brute-force
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: isDev ? 1000 : 10, // login attempts per window per IP
+  message: 'Too many login attempts, please try again later',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true
+});
+
 app.use("/api", apiLimiter);
 app.use("/wml", wmlLimiter);
+app.use("/login", loginLimiter);
 
 // ============ AUTHENTICATION MIDDLEWARE ============
 // Protect all WML pages - redirect to QR if not connected
@@ -2011,8 +2001,8 @@ app.use(session({
   cookie: {
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: '/',
-    httpOnly: false,
-    secure: false,
+    httpOnly: true,       // WAP 1.x gateways never read document.cookie — safe to keep, blocks XSS cookie theft on modern browsers
+    secure: 'auto',       // only sent over HTTPS when the connection actually is HTTPS (see trust proxy, above)
     sameSite: false       // omit SameSite attribute entirely — WAP gateways choke on it
   }
 }));
@@ -2020,19 +2010,22 @@ app.use(session({
 // Strip unknown cookie attributes for WAP 1.x gateways.
 // Some gateways reject Set-Cookie headers with attributes they don't understand
 // (SameSite, Priority, Partitioned, etc.). We rewrite the header to keep only
-// name=value, Path, and Expires — the bare minimum for HTTP/1.0 cookie support.
+// name=value, Path, Expires, HttpOnly and Secure — HttpOnly/Secure are decades-old
+// standard attributes plain HTTP/1.0 gateways already tolerate (they just ignore
+// them, since they never touch document.cookie), so dropping them bought no
+// compatibility and only weakened the session cookie.
 app.use((_req, res, next) => {
   const origSetHeader = res.setHeader.bind(res);
   res.setHeader = (name, value) => {
     if (name.toLowerCase() === 'set-cookie') {
       const cookies = Array.isArray(value) ? value : [value];
       const cleaned = cookies.map(c => {
-        // Keep only: name=value; Path=...; Expires=...
+        // Keep only: name=value; Path=...; Expires=...; HttpOnly; Secure
         const parts = c.split(';').map(p => p.trim());
         const keep = [parts[0]]; // name=value
         for (const p of parts.slice(1)) {
           const lower = p.toLowerCase();
-          if (lower.startsWith('path=') || lower.startsWith('expires=')) {
+          if (lower.startsWith('path=') || lower.startsWith('expires=') || lower === 'httponly' || lower === 'secure') {
             keep.push(p);
           }
         }
@@ -2181,7 +2174,7 @@ const SUPPORTED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 
 function partitionByLid(arr) {
   const jid = [], lid = [];
   for (const item of arr) {
-    if (item.id.startsWith('lid:')) lid.push(item);
+    if (item.id.endsWith('@lid')) lid.push(item);
     else jid.push(item);
   }
   return [jid, lid];
@@ -2494,6 +2487,9 @@ function clearQRFile() {
   }
 }
 let syncAttempts = persistentData.meta.syncAttempts;
+// Separate from syncAttempts (which tracks initial-history-sync retries) so that
+// unrelated sync retries don't inflate the reconnect backoff delay, and vice versa.
+let reconnectAttempts = 0;
 let isConnecting = false; // Prevent race conditions in connection logic
 
 // ============ PRODUCTION-GRADE ADVANCED CACHING SYSTEM ============
@@ -2751,11 +2747,11 @@ function buildRecentChatsHtml(recentChats, legacy = false) {
       const contact = contactStore.get(chat.jid);
       const name = contact?.name || contact?.notify || jidFriendly(chat.jid);
       const lastText = chat.lastMessage ? (messageText(chat.lastMessage) || '') : '';
-      const preview = lastText.length > 16 ? lastText.substring(0, 14) + '..' : lastText;
+      const preview = lastText.length > 16 ? safeSlice(lastText, 14) + '..' : lastText;
       const fromMe = chat.lastMessage?.key?.fromMe;
       const dir = fromMe ? 'out' : 'in';
       const ts = formatRecentTime(chat.lastMessage?.messageTimestamp || chat.conversationTimestamp);
-      html += `<a href="/wml/chat.wml?jid=${encodeURIComponent(chat.jid)}">${esc(name.substring(0, 13))}</a>`;
+      html += `<a href="/wml/chat.wml?jid=${encodeURIComponent(chat.jid)}">${esc(safeSlice(name, 13))}</a>`;
       if (preview) html += ` [${dir}] ${esc(preview)}`;
       if (ts) html += ` <small>${ts}</small>`;
       html += '<br/>';
@@ -2766,23 +2762,17 @@ function buildRecentChatsHtml(recentChats, legacy = false) {
       const contact = contactStore.get(chat.jid);
       const name = contact?.name || contact?.notify || jidFriendly(chat.jid);
       const lastText = chat.lastMessage ? (messageText(chat.lastMessage) || '') : '';
-      const preview = lastText.length > 20 ? lastText.substring(0, 18) + '..' : lastText;
+      const preview = lastText.length > 20 ? safeSlice(lastText, 18) + '..' : lastText;
       const fromMe = chat.lastMessage?.key?.fromMe;
       const dir = fromMe ? 'out' : 'in';
       const ts = formatRecentTime(chat.lastMessage?.messageTimestamp || chat.conversationTimestamp);
       const previewStr = preview ? ` [${dir}] ${esc(preview)}` : '';
       const timeStr = ts ? `<br/><small>${ts}</small>` : '';
-      html += `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(chat.jid)}">${esc(name.substring(0, 15))}</a>${previewStr}${timeStr}</p>`;
+      html += `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(chat.jid)}">${esc(safeSlice(name, 15))}</a>${previewStr}${timeStr}</p>`;
     }
   }
   return html;
 }
-
-// WML Constants
-const WML_DTD =
-  '<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.3//EN" "http://www.wapforum.org/DTD/wml13.dtd">';
-const WMLSCRIPT_DTD =
-  '<!DOCTYPE wmls PUBLIC "-//WAPFORUM//DTD WMLScript 1.3//EN" "http://www.wapforum.org/DTD/wmls13.dtd">';
 
 // WML Helper Functions
 function esc(s = "") {
@@ -2797,6 +2787,18 @@ function esc(s = "") {
         "'": "&#39;",
       }[c])
   );
+}
+
+// Escapes a value for safe interpolation into a vCard 3.0 field (RFC 6350 §3.4).
+// Without this, a field containing a literal newline lets a caller inject
+// arbitrary extra vCard properties or break the card structure — WML's single-line
+// <input> doesn't stop a raw POST body from containing one.
+function vcardEscape(s = "") {
+  return String(s)
+    .replace(/\\/g, "\\\\")
+    .replace(/\r\n|\r|\n/g, " ")
+    .replace(/,/g, "\\,")
+    .replace(/;/g, "\\;");
 }
 
 function saveContacts() {
@@ -3210,12 +3212,29 @@ ${content}
 </html>`;
 }
 
+// iso-8859-1 (Latin-1) can only represent code points 0-255. Without this, iconv
+// silently replaces every out-of-range character (CJK, Cyrillic, Arabic, Hebrew,
+// Greek, emoji, ...) with '?' — one '?' per UTF-16 code unit, so a single emoji
+// becomes '??' with total information loss. XML/WML supports numeric character
+// references (&#NNNN;), so encode those instead: real WML browsers render them
+// as the actual glyph if their font has it, or a fallback box — never silent loss.
+// Iterates by Unicode code point (not UTF-16 code unit) so surrogate pairs
+// (most emoji) are kept whole instead of encoding two lone surrogates.
+function toLatin1Safe(str) {
+  let out = '';
+  for (const ch of str) {
+    const cp = ch.codePointAt(0);
+    out += cp <= 0xFF ? ch : `&#${cp};`;
+  }
+  return out;
+}
+
 function wmlDoc(cards, scripts = "") {
   const head = scripts
     ? `<head><meta http-equiv="Cache-Control" content="no-cache, no-store"/>${scripts}</head>`
     : '<head><meta http-equiv="Cache-Control" content="no-cache, no-store"/></head>';
   return `<?xml version="1.0" encoding="ISO-8859-1"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
 <wml>${head}${cards}</wml>`;
 }
 
@@ -3227,7 +3246,7 @@ function authRedirect(res, url, code = 302) {
 }
 
 function sendWml(res, cards, scripts = "", modeOverride = null) {
-  const mode = modeOverride || MARKUP_MODE;
+  const mode = modeOverride || res.locals?.tier || MARKUP_MODE;
   res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
@@ -3236,7 +3255,7 @@ function sendWml(res, cards, scripts = "", modeOverride = null) {
   const wmlContent = wmlDoc(cards, scripts);
 
   if (mode === 'wml') {
-    const encodedBuffer = iconv.encode(wmlContent, 'iso-8859-1');
+    const encodedBuffer = iconv.encode(toLatin1Safe(wmlContent), 'iso-8859-1');
     res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
     res.send(encodedBuffer);
   } else {
@@ -3249,18 +3268,19 @@ function sendWml(res, cards, scripts = "", modeOverride = null) {
   }
 }
 
-// Sends raw WML content with MARKUP_MODE awareness.
+// Sends raw WML content, tier-aware (see res.locals.tier, set by detectTier()).
 // Use this instead of manually setting Content-Type text/vnd.wap.wml and sending.
-function sendRawWmlAware(res, wmlStr) {
+function sendRawWmlAware(res, wmlStr, modeOverride = null) {
   res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
 
-  if (MARKUP_MODE === 'wml') {
+  const mode = modeOverride || res.locals?.tier || MARKUP_MODE;
+  if (mode === 'wml') {
     res.setHeader("Content-Type", "text/vnd.wap.wml; charset=iso-8859-1");
-    res.send(iconv.encode(wmlStr, 'iso-8859-1'));
+    res.send(iconv.encode(toLatin1Safe(wmlStr), 'iso-8859-1'));
   } else {
-    const transformed = transformWmlToMarkup(wmlStr, MARKUP_MODE);
+    const transformed = transformWmlToMarkup(wmlStr, mode);
     // Serve XHTML as text/html for maximum browser compatibility.
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.send(transformed);
@@ -3292,9 +3312,31 @@ function card(id, title, inner, ontimer = null, scripts = '') {
   </card>`;
 }
 
+// Truncates by Unicode code point, not UTF-16 code unit, so a cut never lands
+// inside a surrogate pair (most emoji) and leaves a corrupt lone surrogate behind.
 function truncate(s = "", max = 64) {
   const str = String(s);
-  return str.length > max ? str.slice(0, max - 3) + "..." : str;
+  const chars = Array.from(str);
+  return chars.length > max ? chars.slice(0, max - 3).join('') + "..." : str;
+}
+
+// Hard-cuts to N *code points* (not UTF-16 units) with no ellipsis — for the many
+// width-constrained display truncations (contact/chat names, previews) that don't
+// want "..." appended. Plain .substring(0, N) can split a surrogate pair in half.
+function safeSlice(str = '', n) {
+  return Array.from(String(str)).slice(0, n).join('');
+}
+
+// Parses a ?page= query param to a safe positive integer, defaulting to 1 for
+// missing/NaN/zero/negative input. Math.max(1, parseInt(x)) does NOT guard
+// against NaN (NaN propagates through Math.max/min unchanged) or negative
+// parseInt results (parseInt('-5') || 1 still evaluates to -5, since -5 is
+// truthy) — both corrupt slice() bounds downstream: NaN silently empties
+// results, and a negative start index makes slice() count from the end of
+// the array instead of clamping to page 1.
+function parsePage(raw) {
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 1 ? n : 1;
 }
 
 
@@ -3303,7 +3345,7 @@ async function getContactName(jid, sock) {
   if (!jid) return "Unknown";
 
   const isGroup = jid.endsWith("@g.us");
-  const isLid = jid.startsWith('lid:'); // Check LID early
+  const isLid = jid.endsWith('@lid'); // Check LID early
 
   // Try to get from contactStore first (cached)
   let contact = contactStore.get(jid);
@@ -3398,13 +3440,6 @@ async function getContactName(jid, sock) {
   }
 }
 
-function parseList(str = "") {
-  return String(str)
-    .split(/[,;\s]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
 // Update formatJid function to handle LIDs
 // Update formatJid function to handle LIDs
 function formatJid(raw = "") {
@@ -3425,20 +3460,14 @@ function jidFriendly(jid = "") {
   if (!jid) return "";
   
   // Handle LIDs
-  if (jid.startsWith('lid:')) {
-    return `LID:${jid.substring(4)}`;
+  if (jid.endsWith('@lid')) {
+    return `LID:${jid.slice(0, -4)}`;
   }
-  
+
   if (jid.endsWith("@s.whatsapp.net"))
     return jid.replace("@s.whatsapp.net", "");
   if (jid.endsWith("@g.us")) return `Group ${jid.slice(0, -5)}`;
   return jid;
-}
-
-function ensureGroupJid(raw = "") {
-  const s = String(raw).trim();
-  if (!s) return s;
-  return s.endsWith("@g.us") ? s : `${s}@g.us`;
 }
 
 function messageText(msg) {
@@ -3508,42 +3537,19 @@ function resultCard(
   return `<card id="result" title="${esc(title)}"${onTimer}>${body}</card>`;
 }
 
-function navigationBar() {
+// withAccessKeys=false for pages whose own local actions already use up 1-4
+// (or more) — WML accesskeys must be unique per card, so those pages render
+// this nav without shortcuts rather than silently duplicating one of theirs.
+function navigationBar(withAccessKeys = true) {
+  const k = (n) => withAccessKeys ? ` accesskey="${n}"` : '';
   return `
     <p>
-      <a href="/wml/home.wml" accesskey="1">${t('home.title')}</a>
-      <a href="/wml/chats.wml" accesskey="2">${t('home.chats')}</a>
-      <a href="/wml/contacts.wml" accesskey="3">${t('home.contacts')}</a>
-      <a href="/wml/send-menu.wml" accesskey="4">${t('common.send')}</a>
+      <a href="/wml/home.wml"${k(1)}>${t('home.title')}</a>
+      <a href="/wml/chats.wml"${k(2)}>${t('home.chats')}</a>
+      <a href="/wml/contacts.wml"${k(3)}>${t('home.contacts')}</a>
+      <a href="/wml/send-menu.wml"${k(4)}>${t('common.send')}</a>
     </p>
   `;
-}
-
-function searchBox(action, placeholder = null) {
-  const safeAction = esc(action);
-  const ph = placeholder || t('common.search') + '...';
-  return `
-    <p>
-      <input name="q" title="${esc(ph)}" size="20" maxlength="50"/>
-    </p>
-    <p>
-      <anchor title="${t('common.search')}">${t('common.search')}
-        <go href="${safeAction}" method="get">
-          <postfield name="q" value="$(q)"/>
-        </go>
-      </anchor>
-    </p>
-    <do type="accept" label="${t('common.search')}">
-      <go href="${safeAction}" method="get">
-        <postfield name="q" value="$(q)"/>
-      </go>
-    </do>
-  `;
-}
-
-// WMLScript functions
-function wmlScript(name, functions) {
-  return `<script src="/wmlscript/${name}.wmls?_rt=${Date.now()}" type="text/vnd.wap.wmlscriptc"/>`;
 }
 
 // ============ LOGIN / LOGOUT ROUTES (WML) ============
@@ -3685,7 +3691,8 @@ app.get("/logout", (req, res) => {
 
 // WMLScript files endpoint
 app.get("/wmlscript/:filename", (req, res) => {
-  if (MARKUP_MODE !== 'wml') {
+  const tier = res.locals?.tier || detectTier(req);
+  if (tier !== 'wml') {
     return res.status(404).send('WMLScript not available in current markup mode');
   }
   const { filename } = req.params;
@@ -3766,7 +3773,7 @@ app.get(["/wml", "/wml/home.wml", "/wml/home.eml", "/home.wml", "/home.eml"], (r
       const jid = userSettings.favorites[i];
       const contact = contactStore.get(jid);
       const name = contact?.name || contact?.notify || jidFriendly(jid);
-      favoritesHtml += `<a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">[${i + 1}] ${esc(name.substring(0, 12))}</a><br/>`;
+      favoritesHtml += `<a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">[${i + 1}] ${esc(safeSlice(name, 12))}</a><br/>`;
     }
     if (userSettings.favorites.length > 3) {
       favoritesHtml += `<a href="/wml/favorites.wml">[+${userSettings.favorites.length - 3} ${t('common.more')}]</a>`;
@@ -3822,151 +3829,6 @@ app.get(["/wml", "/wml/home.wml", "/wml/home.eml", "/home.wml", "/home.eml"], (r
   sendWml(res, card("home", t('home.title'), body, "/wml/home.wml"));
 });
 
-/*
-  const limit = 3 // Messaggi per pagina
-  const offset = Math.max(0, parseInt(req.query.offset || '0'))
-  const search = (req.query.search || '').trim().toLowerCase()
-
-  // Chat history is loaded from persistent storage on startup
-  // No need to fetch from WhatsApp servers every time
-  // The initial sync already handles this
-
-  // Messages already stored oldest→newest via binary insertion — no sort needed
-  let allMessages = (chatStore.get(jid) || []).slice()
-
-  // Applica filtro di ricerca se presente
-  if (search) {
-    allMessages = allMessages.filter(m => (messageText(m) || '').toLowerCase().includes(search))
-  }
-
-  // Per la paginazione con ordinamento crescente, prendiamo gli ultimi messaggi
-  // ma li mostriamo nell'ordine corretto (dal più vecchio al più recente)
-  const totalMessages = allMessages.length
-  const startIndex = Math.max(0, totalMessages - limit - offset)
-  const endIndex = totalMessages - offset
-  const slice = allMessages.slice(startIndex, endIndex)
-
-  const contact = contactStore.get(jid)
-  const chatName = contact?.name || contact?.notify || contact?.verifiedName || jidFriendly(jid)
-  const number = jidFriendly(jid)
-
-  // Escape sicuro e rimuove caratteri non ASCII
-  // Uses global escWml — single-pass O(L) instead of O(5L)
-
-  let messageList
-  if (slice.length === 0) {
-    messageList = `<p>${t('chat.no_messages')}</p>
-      <p>
-        <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}" accesskey="2">${t('chat.clear_search')}</a> |
-        <a href="/wml/chats.wml" accesskey="0">${t('chat.back_to_chats')}</a>
-      </p>`
-  } else {
-    messageList = slice.map((m, idx) => {
-      const who = m.key.fromMe ? t('chat.me') : chatName
-      const text = truncate(messageText(m), 100)
-      const tsDate = new Date(Number(m.messageTimestamp) * 1000)
-      const ts = tsDate.toLocaleDateString('en-GB', { day: '2-digit', month: '2-digit', year: 'numeric' }) + ' ' + tsDate.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-      const mid = m.key.id
-      
-      return `<p><b>${idx + 1}. ${escWml(who)}</b> (${ts})<br/>
-        ${escWml(text)}<br/>
-        <a href="/wml/msg.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}" accesskey="${Math.min(idx + 1, 9)}">[Actions]</a>
-      </p>`
-    }).join('')
-  }
-
-  // Navigazione corretta per ordinamento crescente
-  const olderOffset = offset + limit
-  const olderLink = olderOffset < totalMessages
-    ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(search)}" accesskey="2">${t('chat.older')}</a>` : ''
-
-  const newerOffset = Math.max(0, offset - limit)
-  const newerLink = offset > 0
-    ? `<a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(search)}" accesskey="3">${t('chat.newer')}</a>` : ''
-
-  // Search form sempre visibile
-  const searchForm = `
-    <p><b>${t('chat.search_messages')}</b></p>
-    <p>
-      <input name="searchQuery" title="${t('chat.search_placeholder')}" value="${escWml(search)}" size="15" maxlength="50"/>
-    </p>
-    <p>
-      <anchor title="${t('common.search')}">${t('common.search')}
-        <go href="/wml/chat.wml" method="get">
-          <postfield name="jid" value="${escWml(jid)}"/>
-          <postfield name="search" value="$(searchQuery)"/>
-          <postfield name="offset" value="0"/>
-        </go>
-      </anchor>
-    </p>
-    <do type="accept" label="${t('common.search')}">
-      <go href="/wml/chat.wml" method="get">
-        <postfield name="jid" value="${escWml(jid)}"/>
-        <postfield name="search" value="$(searchQuery)"/>
-        <postfield name="offset" value="0"/>
-      </go>
-    </do>
-    ${search ? `<p>${t('chat.searching')} <b>${escWml(search)}</b> | <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${t('chat.clear_search')}</a></p>` : ''}
-  `
-
-  // Indicatori di paginazione migliorati
-  const currentPage = Math.floor(offset / limit) + 1
-  const totalPages = Math.ceil(totalMessages / limit)
-  const paginationInfo = `
-    <p><b>${t('chat.total')} ${totalMessages} ${t('chat.messages')}</b></p>
-    <p>${t('chat.page')} ${currentPage}/${totalPages}</p>
-  `
-
-  const body = `
-    <p><b>${escWml(chatName)}</b></p>
-    <p>${escWml(number)} | ${t('chat.total')} ${totalMessages} ${t('chat.messages')}</p>
-
-    ${searchForm}
-
-    ${paginationInfo}
-
-    ${messageList}
-
-    <p><b>${t('chat.navigation')}</b></p>
-    <p>${olderLink} ${olderLink && newerLink ? ' | ' : ''} ${newerLink}</p>
-
-    <p><b>${t('chat.quick_actions')}</b></p>
-    <p>
-      <a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">${t('chat.send_text')}</a> |
-      <a href="/wml/contact.wml?jid=${encodeURIComponent(jid)}" accesskey="4">${t('chat.contact_info')}</a>
-      ${number && !jid.endsWith('@g.us') ? ` | <a href="wtai://wp/mc;${number}" accesskey="9">${t('chat.call')}</a>` : ''}
-    </p>
-
-    <p>
-      <a href="/wml/chats.wml" accesskey="0">${t('chat.back')}</a> |
-      <a href="/wml/home.wml" accesskey="*">${t('chat.home')}</a>
-    </p>
-
-    <do type="accept" label="${t('common.send')}">
-      <go href="/wml/send.text.wml?to=${encodeURIComponent(jid)}"/>
-    </do>
-    <do type="options" label="${t('common.refresh')}">
-      <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${offset}&amp;search=${encodeURIComponent(search)}"/>
-    </do>
-  `
-
-  res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=UTF-8')
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
-  res.setHeader('Pragma', 'no-cache')
-  res.setHeader('Expires', '0')
-  
-  res.send(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
-<wml>
-  <head>
-    <meta http-equiv="Cache-Control" content="no-cache, no-store"/>
-  </head>
-  <card id="chat" title="${escWml(chatName)}">
-    ${body}
-  </card>
-</wml>`)
-})*/
-
 // Enhanced Status page
 app.get("/wml/status.wml", (req, res) => {
   const connected = !!sock?.authState?.creds && connectionState === 'open';
@@ -3990,7 +3852,7 @@ app.get("/wml/status.wml", (req, res) => {
 
     <p><b>${t('status.sync_actions')}</b></p>
     <p>
-      <a href="/wml/sync.full.wml" accesskey="1">${t('status.sync')}</a>
+      <a href="/wml/sync.full.wml" accesskey="5">${t('status.sync')}</a>
     </p>
 
     ${navigationBar()}
@@ -4098,7 +3960,7 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
 
   if (isConnected) {
     return sendRawWml(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
 <wml>
   <card id="connected" title="WhatsApp">
     <p>WhatsApp Connected</p>
@@ -4110,7 +3972,7 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
 
   if (!currentQR) {
     return sendRawWml(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
 <wml>
   <card id="noqr" title="QR">
     <p>Connecting...</p>
@@ -4123,7 +3985,7 @@ app.get("/api/qr/wml-wbmp", (req, res) => {
 
   // WAP 1.0 compatible page with WBMP QR code
   sendRawWml(`<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.0//EN" "http://www.wapforum.org/DTD/wml_1.0.xml">
+<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
 <wml>
   <card id="qr" title="WhatsApp QR">
     <p>Scan QR Code</p>
@@ -4935,19 +4797,15 @@ app.get("/wml/favorites-add.wml", (req, res) => {
 // Enhanced Contacts with search and pagination
 
 app.get("/wml/contacts.wml", (req, res) => {
-  const userAgent = req.headers["user-agent"] || "";
-
   // Usa req.query per GET. Se il form usa POST, i dati sarebbero in req.body.
   // La <go> con method="get" mette i dati in query string.
   const query = req.query;
 
   const page = Math.max(1, parseInt(query.page || "1"));
-  let limit = 3; // Fisso a 3 elementi per pagina
-
-  // Limiti più restrittivi per dispositivi WAP 1.0
-
-    limit = Math.min(3, limit); // Max 3 elementi per pagina
-
+  // WAP 1.0 screens are tiny — keep pages short there regardless of the user's
+  // configured preference; xhtml/html5 devices can handle the configured size.
+  const tier = res.locals?.tier || detectTier(req);
+  const limit = tier === 'wml' ? 3 : (userSettings.paginationLimit || 10);
 
   const search = query.q || "";
   const refreshNonce = Date.now();
@@ -5001,14 +4859,14 @@ app.get("/wml/contacts.wml", (req, res) => {
     page > 1
       ? `<a href="/wml/contacts.wml?page=${
           page - 1
-        }&amp;limit=${limit}&amp;q=${encodeURIComponent(search)}">${t('contacts.prev')}</a>`
+        }&amp;limit=${limit}&amp;q=${encodeURIComponent(search)}" accesskey="7">${t('contacts.prev')}</a>`
       : "";
 
   const nextPage =
     page < totalPages
       ? `<a href="/wml/contacts.wml?page=${
           page + 1
-        }&amp;limit=${limit}&amp;q=${encodeURIComponent(search)}">${t('contacts.next')}</a>`
+        }&amp;limit=${limit}&amp;q=${encodeURIComponent(search)}" accesskey="8">${t('contacts.next')}</a>`
       : "";
 
   const lastPage =
@@ -5114,7 +4972,9 @@ app.get("/wml/contact.wml", async (req, res) => {
     let businessProfile = null;
 
     try {
-      status = await sock.fetchStatus(jid);
+      // fetchStatus is variadic and returns one {id, status:{status,setAt}} entry per jid queried
+      const statusResults = await sock.fetchStatus(jid);
+      status = statusResults?.[0]?.status || null;
       businessProfile = await sock.getBusinessProfile(jid);
     } catch (e) {
       // Silently fail for these optional features
@@ -5134,11 +4994,11 @@ app.get("/wml/contact.wml", async (req, res) => {
 
       <p><b>${t('contact.quick_actions')}</b></p>
       <p>
-        <a href="wtai://wp/mc;${number}" accesskey="1">${t('contact.call')}</a><br/>
-        <a href="wtai://wp/sms;${number};" accesskey="2">${t('contact.sms')}</a><br/>
+        <a href="wtai://wp/mc;${esc(number)}" accesskey="1">${t('contact.call')}</a><br/>
+        <a href="wtai://wp/sms;${esc(number)};" accesskey="2">${t('contact.sms')}</a><br/>
         <a href="wtai://wp/ap;${esc(
           contact?.name || number
-        )};${number}" accesskey="3">${t('contact.add_phone')}</a><br/>
+        )};${esc(number)}" accesskey="3">${t('contact.add_phone')}</a><br/>
       </p>
 
       <p><b>${t('contact.wa_actions')}</b></p>
@@ -5166,13 +5026,13 @@ app.get("/wml/contact.wml", async (req, res) => {
         )}" accesskey="8">${t('contact.unblock')}</a><br/>
       </p>
 
-      ${navigationBar()}
+      ${navigationBar(false)}
 
       <do type="accept" label="${t('chats.title')}">
         <go href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;limit=3"/>
       </do>
       <do type="options" label="${t('contact.call')}">
-        <go href="wtai://wp/mc;${number}"/>
+        <go href="wtai://wp/mc;${esc(number)}"/>
       </do>
     `;
 
@@ -5266,369 +5126,12 @@ app.post("/wml/unblock", async (req, res) => {
   }
 });
 
-/*
-app.get('/wml/chat.wml', async (req, res) => {
-  const userAgent = req.headers['user-agent'] || ''
-  const isOldNokia = /Nokia|Series40|MAUI|UP\.Browser/i.test(userAgent)
-  
-  const raw = req.query.jid || ''
-  const jid = formatJid(raw)
-  const offset = Math.max(0, parseInt(req.query.offset || '0'))
-  const search = (req.query.search || '').trim().toLowerCase()
-  
-  // Very small limits for Nokia 7210
-  const limit = 3
-  
-  // Chat history is loaded from persistent storage on startup
-  // No need to fetch from WhatsApp servers every time
-  
-  // Messages stored oldest→newest. For "most recent first" without O(M) copy+reverse:
-  const rawMessages = chatStore.get(jid) || [];
-  let allMessages, total, items;
-  if (search) {
-    // Search needs full scan — filter using cached lowercase text
-    const searchL = search.toLowerCase();
-    allMessages = [];
-    for (let i = rawMessages.length - 1; i >= 0; i--) {
-      const txt = getMessageSearchText(rawMessages[i]);
-      if (txt.includes(searchL)) allMessages.push(rawMessages[i]);
-    }
-    total = allMessages.length;
-    items = allMessages.slice(offset, offset + limit);
-  } else {
-    // No search: compute reverse window directly — O(limit) instead of O(M)
-    total = rawMessages.length;
-    const revStart = total - 1 - offset;
-    const revEnd = Math.max(-1, revStart - limit);
-    items = [];
-    for (let i = revStart; i > revEnd && i >= 0; i--) {
-      items.push(rawMessages[i]);
-    }
-  }
-  
-  const contact = contactStore.get(jid)
-  const chatName = contact?.name || contact?.notify || contact?.verifiedName || jidFriendly(jid)
-  const number = jidFriendly(jid)
-  const isGroup = jid.endsWith('@g.us')
-  
-  // Simple escaping for Nokia 7210
-  const esc = text => (text || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-  
-  // Simple truncate
-  const truncate = (text, maxLength) => {
-    if (!text) return ''
-    if (text.length <= maxLength) return text
-    return text.substring(0, maxLength - 3) + '...'
-  }
-  
-  // Simple timestamp for Nokia
-  const formatTime = (timestamp) => {
-    const date = new Date(Number(timestamp) * 1000)
-    if (isNaN(date.getTime())) return ''
-
-    const day = date.getDate().toString().padStart(2, '0')
-    const month = (date.getMonth() + 1).toString().padStart(2, '0')
-    const year = date.getFullYear()
-    const hours = date.getHours().toString().padStart(2, '0')
-    const mins = date.getMinutes().toString().padStart(2, '0')
-    const secs = date.getSeconds().toString().padStart(2, '0')
-
-    return `${day}/${month}/${year} ${hours}:${mins}:${secs}`
-  }
-  
-  let messageList = ''
-  
-  if (items.length === 0) {
-    messageList = '<p>No messages</p>'
-  } else {
-    messageList = items.map((m, idx) => {
-      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
-      const time = formatTime(m.messageTimestamp)
-      const msgNumber = idx + 1
-      const mid = m.key.id
-      
-      // Handle different message types for Nokia
-      let text = ''
-      let mediaLink = ''
-      
-      if (m.message) {
-        if (m.message.imageMessage) {
-          const img = m.message.imageMessage
-          const size = Math.round((img.fileLength || 0) / 1024)
-          text = `[IMG ${size}KB]`
-          if (img.caption) text += ` ${truncate(img.caption, 30)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View IMG]</a>`
-          
-        } else if (m.message.videoMessage) {
-          const vid = m.message.videoMessage
-          const size = Math.round((vid.fileLength || 0) / 1024)
-          text = `[VID ${size}KB]`
-          if (vid.caption) text += ` ${truncate(vid.caption, 30)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View VID]</a>`
-          
-        } else if (m.message.audioMessage) {
-          const aud = m.message.audioMessage
-          const size = Math.round((aud.fileLength || 0) / 1024)
-          const duration = aud.seconds || 0
-          text = `[AUD ${size}KB ${duration}s]`
-          // Show transcription preview if available
-          if (m.transcription && m.transcription !== '[Trascrizione fallita]' && m.transcription !== '[Audio troppo lungo per la trascrizione]') {
-            text += `<br/><small>${truncate(m.transcription, 60)}</small>`
-          }
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View AUD]</a>` +
-            ` <a href="/wml/media/${encodeURIComponent(mid)}.mp3">[MP3]</a>` +
-            ` <a href="/wml/media/${encodeURIComponent(mid)}.amr">[AMR]</a>`
-          
-        } else if (m.message.documentMessage) {
-          const doc = m.message.documentMessage
-          const size = Math.round((doc.fileLength || 0) / 1024)
-          const filename = doc.fileName || 'file'
-          text = `[DOC ${size}KB] ${truncate(filename, 20)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View DOC]</a>`
-          
-        } else if (m.message.stickerMessage) {
-          text = '[STICKER]'
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View STK]</a>`
-          
-        } else {
-          text = truncate(messageText(m) || '', 50)
-        }
-      } else {
-        text = truncate(messageText(m) || '', 50)
-      }
-      
-      return `<p>${msgNumber}. ${esc(who)} (${time})<br/>${esc(text)}${mediaLink}</p>`
-    }).join('')
-  }
-  
-  // Simple navigation for Nokia
-  const olderOffset = offset + limit
-  const olderLink = olderOffset < total ? 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(search)}" accesskey="2">2-Older</a></p>` : ''
-  
-  const newerOffset = Math.max(0, offset - limit)
-  const newerLink = offset > 0 ? 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(search)}" accesskey="3">3-Newer</a></p>` : ''
-  
-  // Simple search for Nokia
-  const searchBox = search ? 
-    `<p>Search: ${esc(search)}</p><p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">Clear</a></p>` : 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;search=prompt">Search</a></p>`
-  
-  const body = `<p>${esc(chatName.length > 15 ? chatName.substring(0, 15) : chatName)}</p>
-<p>Msgs ${offset + 1}-${Math.min(offset + limit, total)}/${total}</p>
-${searchBox}
-${messageList}
-${newerLink}
-${olderLink}
-<p><a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">1-Send</a></p>
-<p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
-  
-  // Nokia 7210 compatible WML 1.1
-  const wmlOutput = `<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
-<wml>
-<head><meta http-equiv="Cache-Con\l" content="no-cache, no-store"/></head>
-<card id="chat" title="Chat">
-${body}
-</card>
-</wml>`
-  
-  // Nokia 7210 headers
-  res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=iso-8859-1')
-  res.setHeader('Cache-Control', 'no-cache')
-  res.setHeader('Pragma', 'no-cache')
-  
-  const encodedBuffer = iconv.encode(wmlOutput, 'iso-8859-1')
-  res.send(encodedBuffer)
-})*/
-/*
-// Route per scaricare media - compatibile Nokia 7210
-app.get('/wml/chat.wml', async (req, res) => {
-  const userAgent = req.headers['user-agent'] || ''
-  const isOldNokia = /Nokia|Series40|MAUI|UP\.Browser/i.test(userAgent)
-  
-  const raw = req.query.jid || ''
-  const jid = formatJid(raw)
-  const offset = Math.max(0, parseInt(req.query.offset || '0'))
-  const search = (req.query.search || '').trim().toLowerCase()
-  
-  // Very small limits for Nokia 7210
-  const limit = 3
-  
-  // Chat history is loaded from persistent storage on startup
-  // No need to fetch from WhatsApp servers every time
-  
-  // Messages stored oldest→newest. For "most recent first" without O(M) copy+reverse:
-  const rawMessages = chatStore.get(jid) || [];
-  let allMessages, total, items;
-  if (search) {
-    // Search needs full scan — filter using cached lowercase text
-    const searchL = search.toLowerCase();
-    allMessages = [];
-    for (let i = rawMessages.length - 1; i >= 0; i--) {
-      const txt = getMessageSearchText(rawMessages[i]);
-      if (txt.includes(searchL)) allMessages.push(rawMessages[i]);
-    }
-    total = allMessages.length;
-    items = allMessages.slice(offset, offset + limit);
-  } else {
-    // No search: compute reverse window directly — O(limit) instead of O(M)
-    total = rawMessages.length;
-    const revStart = total - 1 - offset;
-    const revEnd = Math.max(-1, revStart - limit);
-    items = [];
-    for (let i = revStart; i > revEnd && i >= 0; i--) {
-      items.push(rawMessages[i]);
-    }
-  }
-  
-  const contact = contactStore.get(jid)
-  const chatName = contact?.name || contact?.notify || contact?.verifiedName || jidFriendly(jid)
-  const number = jidFriendly(jid)
-  const isGroup = jid.endsWith('@g.us')
-  
-  // Simple escaping for Nokia 7210
-  const esc = text => (text || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-  
-  // Simple truncate
-  const truncate = (text, maxLength) => {
-    if (!text) return ''
-    if (text.length <= maxLength) return text
-    return text.substring(0, maxLength - 3) + '...'
-  }
-  
-  // Simple timestamp for Nokia
-  const formatTime = (timestamp) => {
-    const date = new Date(Number(timestamp) * 1000)
-    if (isNaN(date.getTime())) return ''
-
-    const day = date.getDate().toString().padStart(2, '0')
-    const month = (date.getMonth() + 1).toString().padStart(2, '0')
-    const year = date.getFullYear()
-    const hours = date.getHours().toString().padStart(2, '0')
-    const mins = date.getMinutes().toString().padStart(2, '0')
-    const secs = date.getSeconds().toString().padStart(2, '0')
-
-    return `${day}/${month}/${year} ${hours}:${mins}:${secs}`
-  }
-  
-  let messageList = ''
-  
-  if (items.length === 0) {
-    messageList = '<p>No messages</p>'
-  } else {
-    messageList = items.map((m, idx) => {
-      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
-      const time = formatTime(m.messageTimestamp)
-      const msgNumber = idx + 1
-      const mid = m.key.id
-      
-      // Handle different message types for Nokia
-      let text = ''
-      let mediaLink = ''
-      
-      if (m.message) {
-        if (m.message.imageMessage) {
-          const img = m.message.imageMessage
-          const size = Math.round((img.fileLength || 0) / 1024)
-          text = `[IMG ${size}KB]`
-          if (img.caption) text += ` ${truncate(img.caption, 30)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View IMG]</a>`
-          
-        } else if (m.message.videoMessage) {
-          const vid = m.message.videoMessage
-          const size = Math.round((vid.fileLength || 0) / 1024)
-          text = `[VID ${size}KB]`
-          if (vid.caption) text += ` ${truncate(vid.caption, 30)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View VID]</a>`
-          
-        } else if (m.message.audioMessage) {
-          const aud = m.message.audioMessage
-          const size = Math.round((aud.fileLength || 0) / 1024)
-          const duration = aud.seconds || 0
-          text = `[AUD ${size}KB ${duration}s]`
-          // Show transcription preview if available
-          if (m.transcription && m.transcription !== '[Trascrizione fallita]' && m.transcription !== '[Audio troppo lungo per la trascrizione]') {
-            text += `<br/><small>${truncate(m.transcription, 60)}</small>`
-          }
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View AUD]</a>` +
-            ` <a href="/wml/media/${encodeURIComponent(mid)}.mp3">[MP3]</a>` +
-            ` <a href="/wml/media/${encodeURIComponent(mid)}.amr">[AMR]</a>`
-          
-        } else if (m.message.documentMessage) {
-          const doc = m.message.documentMessage
-          const size = Math.round((doc.fileLength || 0) / 1024)
-          const filename = doc.fileName || 'file'
-          text = `[DOC ${size}KB] ${truncate(filename, 20)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View DOC]</a>`
-          
-        } else if (m.message.stickerMessage) {
-          text = '[STICKER]'
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View STK]</a>`
-          
-        } else {
-          text = truncate(messageText(m) || '', 50)
-        }
-      } else {
-        text = truncate(messageText(m) || '', 50)
-      }
-      
-      return `<p>${msgNumber}. ${esc(who)} (${time})<br/>${esc(text)}${mediaLink}</p>`
-    }).join('')
-  }
-  
-  // Simple navigation for Nokia
-  const olderOffset = offset + limit
-  const olderLink = olderOffset < total ? 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(search)}" accesskey="2">2-Older</a></p>` : ''
-  
-  const newerOffset = Math.max(0, offset - limit)
-  const newerLink = offset > 0 ? 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(search)}" accesskey="3">3-Newer</a></p>` : ''
-  
-  // Simple search for Nokia
-  const searchBox = search ? 
-    `<p>Search: ${esc(search)}</p><p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">Clear</a></p>` : 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;search=prompt">Search</a></p>`
-  
-  const body = `<p>${esc(chatName.length > 15 ? chatName.substring(0, 15) : chatName)}</p>
-<p>Msgs ${offset + 1}-${Math.min(offset + limit, total)}/${total}</p>
-${searchBox}
-${messageList}
-${newerLink}
-${olderLink}
-<p><a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">1-Send</a></p>
-<p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
-  
-  // Nokia 7210 compatible WML 1.1
-  const wmlOutput = `<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
-<wml>
-<head><meta http-equiv="Cache-Control" content="no-cache, no-store"/></head>
-<card id="chat" title="Chat">
-${body}
-</card>
-</wml>`
-  
-  // Nokia 7210 headers
-  res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=iso-8859-1')
-  res.setHeader('Cache-Control', 'no-cache')
-  res.setHeader('Pragma', 'no-cache')
-  
-  const encodedBuffer = iconv.encode(wmlOutput, 'iso-8859-1')
-  res.send(encodedBuffer)
-})*/
-
 app.get("/wml/chat.wml", async (req, res) => {
-  const userAgent = req.headers["user-agent"] || "";
-  const isOldNokia = true;
+  const tier = res.locals?.tier || detectTier(req);
+  // Compact Nokia-style labels/truncation and WBMP-only media links only make sense
+  // for real WAP 1.0 devices — xhtml/html5 tiers get the fuller labels and real
+  // jpg/mp4/gif media links the (previously dead) `else` branches below already built.
+  const isOldNokia = tier === 'wml';
 
   const raw = req.query.jid || "";
   const jid = formatJid(raw);
@@ -5640,8 +5143,7 @@ app.get("/wml/chat.wml", async (req, res) => {
   const offset = Math.max(0, parseInt(req.query.offset || "0"));
   const search = (req.query.search || "").trim().toLowerCase();
 
-  // Fixed limit to 3 elements per page
-  const limit = 3;
+  const limit = userSettings.paginationLimit || 10;
 
   // Chat history is loaded from persistent storage on startup
   // Messages are already sorted when saved (most recent last)
@@ -5672,11 +5174,12 @@ app.get("/wml/chat.wml", async (req, res) => {
   // Enhanced escaping that works for both Nokia and modern devices
   // Uses global escWml — single-pass O(L) instead of O(5L)
 
-  // Truncation function
+  // Truncation function — by code point, so a cut never splits a surrogate pair (emoji)
   const truncate = (text, maxLength) => {
     if (!text) return "";
-    if (text.length <= maxLength) return text;
-    return text.substring(0, maxLength - 3) + "...";
+    const chars = Array.from(text);
+    if (chars.length <= maxLength) return text;
+    return chars.slice(0, maxLength - 3).join('') + "...";
   };
 
   // Enhanced timestamp formatting with date and time
@@ -5732,7 +5235,7 @@ app.get("/wml/chat.wml", async (req, res) => {
 
             // Show name + number for groups
             who = isOldNokia
-              ? `${senderName.substring(0, 10)} (${senderNumber.substring(0, 10)})`
+              ? `${safeSlice(senderName, 10)} (${safeSlice(senderNumber, 10)})`
               : `${senderName} (${senderNumber})`;
           } else {
             who = m.pushName || "Unknown";
@@ -5740,7 +5243,7 @@ app.get("/wml/chat.wml", async (req, res) => {
         } else {
           // Direct chat - use chat name
           who = isOldNokia && chatName.length > 10
-            ? chatName.substring(0, 10)
+            ? safeSlice(chatName, 10)
             : chatName;
         }
         const time = formatMessageTimestamp(m.messageTimestamp);
@@ -5880,7 +5383,7 @@ app.get("/wml/chat.wml", async (req, res) => {
         // Format message entry
         if (isOldNokia) {
           const dir = m.key.fromMe ? "[out]" : "[in]";
-          const shortWho = who.length > 9 ? who.substring(0, 8) + "." : who;
+          const shortWho = who.length > 9 ? safeSlice(who, 8) + "." : who;
           return `<p>${dir} ${time} <b>${escWml(shortWho)}</b><br/>${escWml(text)}${mediaLink}</p>`;
         } else {
           const typeIndicator = m.key.fromMe ? "[out]" : "[in]";
@@ -6123,12 +5626,12 @@ app.get("/wml/chat.wml", async (req, res) => {
        )}" accesskey="4">[4] Contact Info</a>
        ${
          number && !isGroup
-           ? ` | <a href="wtai://wp/mc;${number}" accesskey="9">[9] Call</a>`
+           ? ` | <a href="wtai://wp/mc;${esc(number)}" accesskey="9">[9] Call</a>`
            : ""
        }
        ${
          number && !isGroup
-           ? ` | <a href="wtai://wp/ms;${number};">[SMS]</a>`
+           ? ` | <a href="wtai://wp/ms;${esc(number)};">[SMS]</a>`
            : ""
        }
        <br/>
@@ -6142,7 +5645,7 @@ app.get("/wml/chat.wml", async (req, res) => {
   // Build final body
   const chatTitle = isOldNokia
     ? chatName.length > 15
-      ? chatName.substring(0, 15)
+      ? safeSlice(chatName, 15)
       : chatName
     : chatName;
   const refreshNonce = Date.now();
@@ -6236,6 +5739,24 @@ function createWBMP(pixels, width, height) {
   }
 
   return Buffer.concat([typeField, fixHeader, widthBytes, heightBytes, data]);
+}
+
+// Renders text (a QR payload, or a plaintext fallback message) as a REAL WBMP —
+// this used to be faked by relabeling a PNG's Content-Type, which no WAP 1.0
+// microbrowser can actually decode. Reuses the same createWBMP() encoder already
+// used for chat media and profile pictures, instead of a third hand-rolled copy.
+async function qrToWbmp(text, size = 128) {
+  const pngBuffer = await QRCode.toBuffer(text, {
+    type: "png",
+    width: size,
+    margin: 1,
+    color: { dark: "#000000", light: "#FFFFFF" },
+  });
+  const { data: pixels, info } = await sharp(pngBuffer)
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  return createWBMP(pixels, info.width, info.height);
 }
 
 app.get("/wml/audio-transcription.wml", async (req, res) => {
@@ -6535,6 +6056,10 @@ app.get("/wml/media/:filename", async (req, res) => {
             console.log(`Video 3GP creato: ${mediaData.length} bytes`);
           } catch (convError) {
             console.error("Errore conversione 3GP:", convError);
+            // Clean up whatever got written before the failure — the success path
+            // does this itself, but a thrown error skips straight past it.
+            unlinkSilent(safeTempPath(`video_${messageId}_input.mp4`));
+            unlinkSilent(safeTempPath(`video_${messageId}_output.3gp`));
             // Fallback: reuse already-downloaded buffer (no redundant network I/O)
             mimeType = vid.mimetype || "video/mp4";
             filename_out = `video_${messageId}.mp4`;
@@ -6678,6 +6203,10 @@ app.get("/wml/media/:filename", async (req, res) => {
             console.log(`Audio ${requestedFormat.toUpperCase()} creato: ${mediaData.length} bytes`);
           } catch (convError) {
             console.error(`Errore conversione ${requestedFormat}:`, convError);
+            // Clean up whatever got written before the failure — the success path
+            // does this itself, but a thrown error (incl. the 30s timeout) skips it.
+            unlinkSilent(safeTempPath(`audio_${messageId}_input.ogg`));
+            unlinkSilent(safeTempPath(`audio_${messageId}_output.${requestedFormat}`));
             // Fallback: serve original OGG instead of failing completely
             mimeType = aud.mimetype || "audio/ogg";
             filename_out = `audio_${messageId}.ogg`;
@@ -7002,7 +6531,7 @@ Press [7]/[8] to download JPG/PNG.</small></p>
     <p>
       <a href="/wml/media/${encodeURIComponent(
         messageId
-      )}.ogg" accesskey="9">[9] OGG</a>
+      )}.ogg" accesskey="1">[1] OGG</a>
     </p>`;
           } else if (targetMessage.message?.documentMessage) {
             const doc = targetMessage.message.documentMessage;
@@ -7253,11 +6782,11 @@ app.get("/opera/send", async (req, res) => {
 
   // O(1) — early-exit guards before any computation
   if (!sock) {
-    return res.send(operaResultPage(t('opera.disconnected'), t('opera.not_connected'), null));
+    return operaResultPage(res, t('opera.disconnected'), t('opera.not_connected'), null);
   }
 
   if (!jid) {
-    return res.send(operaResultPage(t('common.error'), t('opera.no_recipient'), null));
+    return operaResultPage(res, t('common.error'), t('opera.no_recipient'), null);
   }
 
   // O(1) — Map lookup for contact name
@@ -7278,6 +6807,7 @@ app.get("/opera/send", async (req, res) => {
     <form method="post" action="/opera/upload" enctype="multipart/form-data">
       <input type="hidden" name="jid" value="${jid}">
       <input type="hidden" name="useCached" value="1">
+      <input type="hidden" name="cacheTs" value="${cached.timestamp}">
       <label>${t('opera.type_label')}</label>
       <select name="type" style="width:100%;padding:5px;margin-bottom:10px">
         <option value="image">${t('opera.type_image')}</option>
@@ -7293,8 +6823,22 @@ app.get("/opera/send", async (req, res) => {
   </div>`;
   })() : '';
 
+  const tier = res.locals?.tier || detectTier(req);
+
+  // WAP 1.0 / WML 1.x has no file-picker form control at all — there is no WML
+  // markup that could make file sending work here, so say so plainly instead of
+  // falling through to a JS/CSS-based page this device can't render.
+  if (tier === 'wml') {
+    return sendWml(res, card("send-unsupported", t('opera.page_title'), `
+      <p><b>${esc(t('opera.page_title'))}</b></p>
+      <p>${esc(t('opera.wap1_unsupported'))}</p>
+      <p><a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">${t('send_text.title')}</a></p>
+      <p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}" accesskey="0">${t('common.back')}</a></p>
+    `), "", tier);
+  }
+
   // XHTML mode: simple form without JS/CSS/SVG
-  if (UPLOAD_MARKUP_MODE === 'xhtml') {
+  if (tier === 'xhtml') {
     const cachedXhtml = cached && fs.existsSync(cached.path) ? (() => {
       const escapedFilename = cached.originalname.replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const sizeKB = (cached.size / 1024).toFixed(1);
@@ -7307,6 +6851,7 @@ app.get("/opera/send", async (req, res) => {
     <input type="hidden" name="jid" value="${jid}"/>
     <input type="hidden" name="useCached" value="1"/>
     <input type="hidden" name="xhtml" value="1"/>
+    <input type="hidden" name="cacheTs" value="${cached.timestamp}"/>
     <label>${t('opera.type_label')}</label>
     <select name="type">
       <option value="image">${t('opera.type_image')}</option>
@@ -7939,7 +7484,7 @@ app.post("/opera/upload", (req, res) => {
     bb = Busboy({ headers: req.headers, limits: { fileSize: 64 * 1024 * 1024 + 1, files: 1, fields: 20 } });
   } catch (e) {
     console.log('[Upload DEBUG] Busboy init FAILED:', e.message);
-    return res.send(operaResultPage(t('common.error'), t('opera.invalid_request'), null));
+    return operaResultPage(res, t('common.error'), t('opera.invalid_request'), null);
   }
   console.log('[Upload DEBUG] Busboy initialized OK');
 
@@ -7961,7 +7506,7 @@ app.post("/opera/upload", (req, res) => {
       // they fail to follow the Location header and try to render Express's default
       // redirect HTML body, which is not valid XHTML-MP, causing "unknown file format".
       // Instead, serve a proper XHTML-MP page with meta refresh to navigate to the status URL.
-      if (UPLOAD_MARKUP_MODE === 'xhtml') {
+      if ((res.locals?.tier || detectTier(req)) === 'xhtml') {
         res.setHeader("Content-Type", "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
         const escUrl = data.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
@@ -7982,6 +7527,9 @@ app.post("/opera/upload", (req, res) => {
       } else {
         authRedirect(res, data, 303);
       }
+    }
+    else if (typeof data === 'function') {
+      data(); // e.g. () => operaResultPage(res, ...) — sends the response itself, tier-aware
     }
     else {
       res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -8007,12 +7555,12 @@ app.post("/opera/upload", (req, res) => {
     if (!to) {
       file.resume();
       fileReadyResolve(null);
-      return sendOnce(200, operaResultPage(t('common.error'), t('opera.no_recipient2'), null));
+      return sendOnce(200, () => operaResultPage(res, t('common.error'), t('opera.no_recipient2'), null));
     }
     if (!sock) {
       file.resume();
       fileReadyResolve(null);
-      return sendOnce(200, operaResultPage(t('opera.disconnected'), t('opera.not_connected'), null));
+      return sendOnce(200, () => operaResultPage(res, t('opera.disconnected'), t('opera.not_connected'), null));
     }
 
     // Register job
@@ -8069,7 +7617,13 @@ app.post("/opera/upload", (req, res) => {
       console.log('[Upload DEBUG] jobId is NULL => file event never set it. useCached:', useCached, 'to:', to);
       if (useCached && to) {
         const cached = uploadFileCache.get(to);
-        if (cached && fs.existsSync(cached.path)) {
+        // The cache entry can be overwritten (or deleted) between the confirmation
+        // page being rendered and this submit — e.g. a second failed upload to the
+        // same jid from another session — so verify the form's cacheTs still
+        // matches the entry that's live now, instead of trusting `to` alone and
+        // silently sending whatever file happens to be cached at submit time.
+        const cacheTsMatches = cached && String(cached.timestamp) === String(fields.cacheTs || '');
+        if (cached && cacheTsMatches && fs.existsSync(cached.path)) {
           jobId = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
           const contact = contactStore.get(to);
           const contactName = contact?.name || contact?.notify || to.split('@')[0];
@@ -8082,11 +7636,11 @@ app.post("/opera/upload", (req, res) => {
           fileReadyResolve(fileMeta);
         } else {
           fileReadyResolve(null);
-          return sendOnce(200, operaResultPage(t('common.error'), t('opera.no_cache'), to));
+          return sendOnce(200, () => operaResultPage(res, t('common.error'), t('opera.no_cache'), to));
         }
       } else {
         fileReadyResolve(null);
-        return sendOnce(200, operaResultPage(t('common.error'), t('opera.no_file'), to || null));
+        return sendOnce(200, () => operaResultPage(res, t('common.error'), t('opera.no_file'), to || null));
       }
     }
 
@@ -8135,10 +7689,7 @@ app.post("/opera/upload", (req, res) => {
       const j = uploadJobs.get(jobId);
       if (j) { j.percent = 0; j.status = `${t('opera.file_error')}: ${err.message}`; j.done = true; j.error = err.message; }
     }
-    if (!responseSent) {
-      res.setHeader("Content-Type", UPLOAD_MARKUP_MODE === 'xhtml' ? "text/html; charset=utf-8" : "text/html; charset=utf-8");
-    }
-    sendOnce(200, operaResultPage(t('common.error'), t('opera.file_error'), fields.to || fields.jid || null));
+    sendOnce(200, () => operaResultPage(res, t('common.error'), t('opera.file_error'), fields.to || fields.jid || null));
   });
 
   req.on('error', (err) => {
@@ -8314,6 +7865,9 @@ app.post("/opera/upload-chunk", (req, res) => {
     if (!uploadId || isNaN(idx) || isNaN(total) || !to || chunkData.length === 0) {
       return res.status(400).json({ error: 'Missing fields or empty chunk' });
     }
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(uploadId)) {
+      return res.status(400).json({ error: 'Invalid uploadId' });
+    }
     if (!sock) return res.status(503).json({ error: 'WhatsApp disconnesso' });
 
     // Save chunk to disk
@@ -8400,9 +7954,10 @@ app.post("/opera/upload-chunk", (req, res) => {
 // SSR upload progress page — auto-refreshes every 4s via HTTP Refresh header + meta tag.
 app.get("/opera/upload-status", (req, res) => {
   const jobId = req.query.id;
+  const tier = res.locals?.tier || detectTier(req);
 
   if (!jobId || !uploadJobs.has(jobId)) {
-    return res.send(operaResultPage(t('common.error'), t('opera.upload_not_found'), null));
+    return operaResultPage(res, t('common.error'), t('opera.upload_not_found'), null);
   }
 
   const job = uploadJobs.get(jobId);
@@ -8411,7 +7966,7 @@ app.get("/opera/upload-status", (req, res) => {
   // Do NOT delete job: Opera Mini proxy may issue duplicate requests.
   if (job.done) {
     // WML/XHTML mode — serve result via sendWml() pipeline
-    if (UPLOAD_MARKUP_MODE !== 'html5') {
+    if (tier !== 'html5') {
       const title = job.error ? t('common.error') : t('opera.sent');
       const statusMsg = esc(job.status);
       const jid = job.jid;
@@ -8421,14 +7976,13 @@ app.get("/opera/upload-status", (req, res) => {
         ${jid ? `<p><a href="/opera/send?jid=${encodeURIComponent(jid)}">${t('opera.send_more')}</a></p>
         <p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${t('opera.back_to_chat')}</a></p>` : ''}
         <p><a href="/wml/home.wml">${t('common.home')}</a></p>`;
-      return sendWml(res, card("upload-result", title, body), "", UPLOAD_MARKUP_MODE);
+      return sendWml(res, card("upload-result", title, body), "", tier);
     }
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-    if (job.error) return res.send(operaResultPage(t('common.error'), job.status, job.jid));
-    return res.send(operaResultPage(t('opera.sent'), job.status, job.jid));
+    if (job.error) return operaResultPage(res, t('common.error'), job.status, job.jid);
+    return operaResultPage(res, t('opera.sent'), job.status, job.jid);
   }
 
   const pct = job.percent;
@@ -8436,7 +7990,7 @@ app.get("/opera/upload-status", (req, res) => {
   const escapedName = job.contactName.replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
   // WML / XHTML mode — use sendWml() pipeline for consistent rendering
-  if (UPLOAD_MARKUP_MODE !== 'html5') {
+  if (tier !== 'html5') {
     const phaseLabel = pct < 20 ? t('opera.phase_receiving') : pct < 50 ? t('opera.phase_processing') : pct < 85 ? t('opera.phase_sending') : t('opera.phase_finishing');
     const bar = '[' + '#'.repeat(Math.round(pct / 5)) + '.'.repeat(20 - Math.round(pct / 5)) + ']';
     const refreshUrl = `/opera/upload-status?id=${encodeURIComponent(jobId)}`;
@@ -8447,7 +8001,7 @@ app.get("/opera/upload-status", (req, res) => {
       <p><b>${bar} ${pct}%</b></p>
       <p>${escapedStatus}</p>
       <p><a href="${refreshUrl}">${t('opera.refresh_now')}</a></p>`;
-    return sendWml(res, card("upload-progress", t('opera.sending_title'), body, refreshUrl), "", UPLOAD_MARKUP_MODE);
+    return sendWml(res, card("upload-progress", t('opera.sending_title'), body, refreshUrl), "", tier);
   }
 
   // Phase (0=upload 1=processing 2=sending 3=finishing)
@@ -8541,7 +8095,7 @@ app.get("/opera/upload-status", (req, res) => {
       <div class="auto-msg">${t('opera.auto_refresh')}</div>
     </div>
 
-    <a href="/opera/upload-status?id=${jobId}" class="btn">${t('opera.refresh_now')}</a>
+    <a href="/opera/upload-status?id=${encodeURIComponent(jobId)}" class="btn">${t('opera.refresh_now')}</a>
     <div class="note">${t('opera.auto_note')} &bull; ${pct}${t('opera.pct_complete')}</div>
   </div>
 </body>
@@ -8555,38 +8109,55 @@ app.get("/opera/upload-status", (req, res) => {
   res.send(html);
 });
 
-// Helper function to generate result page
-function operaResultPage(title, message, jid) {
-  const escapedMessage = String(message || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Renders + sends the opera upload result page, tier-aware. Sends directly on `res`
+// (rather than returning a string) so the WML tier can go through the real
+// iconv/Content-Type pipeline in sendWml() instead of always being HTML.
+function operaResultPage(res, title, message, jid) {
+  const tier = res.locals?.tier || MARKUP_MODE;
+  const escapedTitle = esc(title);
+  const escapedMessage = esc(String(message || ''));
   const isSuccess = title === t('opera.sent');
   const isDisconnected = title === t('opera.disconnected');
 
-  if (UPLOAD_MARKUP_MODE === 'xhtml') {
+  if (tier === 'wml') {
+    const body = `
+      <p><b>${esc(title)}</b></p>
+      <p>${esc(String(message || ''))}</p>
+      ${jid ? `<p><a href="/opera/send?jid=${encodeURIComponent(jid)}">${t('opera.send_more')}</a></p>
+      <p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${t('opera.back_to_chat')}</a></p>` : ''}
+      <p><a href="/wml/home.wml">${t('opera.contact_list')}</a></p>
+    `;
+    return sendWml(res, card("opera-result", title, body), "", tier);
+  }
+
+  if (tier === 'xhtml') {
     const statusClass = isSuccess ? 'cached-section' : 'upload-section';
-    return `<!DOCTYPE html PUBLIC "-//WAPFORUM//DTD XHTML Mobile 1.0//EN" "http://www.wapforum.org/DTD/xhtml-mobile10.dtd">
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    return res.send(`<!DOCTYPE html PUBLIC "-//WAPFORUM//DTD XHTML Mobile 1.0//EN" "http://www.wapforum.org/DTD/xhtml-mobile10.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
   <meta http-equiv="cache-control" content="no-cache, no-store, must-revalidate"/>
   <meta http-equiv="pragma" content="no-cache"/>
   <meta http-equiv="expires" content="0"/>
-  <title>${title}</title>
+  <title>${escapedTitle}</title>
   <style type="text/css">${XHTML_CSS}</style>
 </head>
 <body>
-  <div class="wa-bar">${title}</div>
+  <div class="wa-bar">${escapedTitle}</div>
   <div class="${statusClass}">
-    <p><b>${title}</b></p>
+    <p><b>${escapedTitle}</b></p>
     <p>${escapedMessage}</p>
   </div>
   ${jid ? `<a class="back-link" href="/opera/send?jid=${encodeURIComponent(jid)}">${t('opera.send_more')}</a>
   <a class="back-link" href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${t('opera.back_to_chat')}</a>` : ''}
   <a class="back-link" href="/wml/home.wml">${t('opera.contact_list')}</a>
 </body>
-</html>`;
+</html>`);
   }
 
-  return `<!DOCTYPE html>
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  return res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -8594,7 +8165,7 @@ function operaResultPage(title, message, jid) {
   <meta http-equiv="cache-control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="pragma" content="no-cache">
   <meta http-equiv="expires" content="0">
-  <title>${title}</title>
+  <title>${escapedTitle}</title>
   ${WAP_FAVICON_LINK}
   <style>
     body { font-family: Arial, sans-serif; margin: 8px; font-size: 14px; text-align: center; padding-top: 20px; }
@@ -8607,14 +8178,14 @@ function operaResultPage(title, message, jid) {
 </head>
 <body>
   <div class="result ${isSuccess ? 'success' : isDisconnected ? 'disconnected' : 'error'}">
-    <h1>${title}</h1>
+    <h1>${escapedTitle}</h1>
     <p>${escapedMessage}</p>
   </div>
   ${jid ? `<a href="/opera/send?jid=${encodeURIComponent(jid)}">${t('opera.send_more')}</a>
   <a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">${t('opera.back_to_chat')}</a>` : ''}
   <a href="/wml/home.wml">${t('opera.contact_list')}</a>
 </body>
-</html>`;
+</html>`);
 }
 
 // ============ VIDEO FRAME PLAYBACK ENDPOINTS ============
@@ -8635,7 +8206,10 @@ app.get("/wml/video-frame/:messageId/:frameNumber", async (req, res) => {
     const frameBuffer = await fs.promises.readFile(framePath);
 
     if (format === 'wbmp') {
-      // Convert to WBMP for Nokia compatibility
+      // Convert to WBMP for Nokia compatibility — uses the shared createWBMP()
+      // encoder (proper multi-byte WBMP width/height header) instead of a
+      // hand-rolled single-byte header, which silently corrupts the image for
+      // any dimension >= 128px (a byte >= 128 sets the WBMP continuation bit).
       const { data: pixels, info } = await sharp(frameBuffer)
         .greyscale()
         .resize(96, 96, { // Smaller for WAP devices
@@ -8651,35 +8225,7 @@ app.get("/wml/video-frame/:messageId/:frameNumber", async (req, res) => {
         .raw()
         .toBuffer({ resolveWithObject: true });
 
-      // Create WBMP header
-      const width = info.width;
-      const height = info.height;
-      const header = Buffer.from([
-        0x00, // Type 0
-        0x00, // FixHeaderField
-        width,
-        height,
-      ]);
-
-      // Convert pixels to WBMP 1-bit format
-      const rowBytes = Math.ceil(width / 8);
-      const wbmpData = Buffer.alloc(rowBytes * height);
-
-      for (let y = 0; y < height; y++) {
-        for (let x = 0; x < width; x++) {
-          const pixelIndex = y * width + x;
-          const pixel = pixels[pixelIndex];
-          const isBlack = pixel < 128;
-
-          if (isBlack) {
-            const byteIndex = y * rowBytes + Math.floor(x / 8);
-            const bitIndex = 7 - (x % 8);
-            wbmpData[byteIndex] |= 1 << bitIndex;
-          }
-        }
-      }
-
-      const wbmpBuffer = Buffer.concat([header, wbmpData]);
+      const wbmpBuffer = createWBMP(pixels, info.width, info.height);
 
       res.setHeader("Content-Type", "image/vnd.wap.wbmp");
       res.send(wbmpBuffer);
@@ -8840,12 +8386,6 @@ app.get("/wml/video-format.wml", async (req, res) => {
     const jid = req.query.jid || "";
     const frame = req.query.frame || "1";
 
-    const esc = (text) =>
-      (text || "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-
     const body = `<p><b>Select Video Format</b></p>
 <p>Choose format for frame display:</p>
 
@@ -8894,12 +8434,6 @@ app.get("/wml/image-format.wml", async (req, res) => {
   try {
     const messageId = req.query.mid || "";
     const jid = req.query.jid || "";
-
-    const esc = (text) =>
-      (text || "")
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
 
     const body = `<p><b>Select Image Format</b></p>
 <p>Choose format for image display:</p>
@@ -9111,185 +8645,6 @@ ${body}
   }
 });
 
-/*
-app.get('/wml/chat.wml', async (req, res) => {
-  const userAgent = req.headers['user-agent'] || ''
-  const isOldNokia = /Nokia|Series40|MAUI|UP\.Browser/i.test(userAgent)
-  
-  const raw = req.query.jid || ''
-  const jid = formatJid(raw)
-  const offset = Math.max(0, parseInt(req.query.offset || '0'))
-  const search = (req.query.search || '').trim().toLowerCase()
-  
-  // Very small limits for Nokia 7210
-  const limit = 3
-  
-  // Chat history is loaded from persistent storage on startup
-  // No need to fetch from WhatsApp servers every time
-  
-  // Messages stored oldest→newest. For "most recent first" without O(M) copy+reverse:
-  const rawMessages = chatStore.get(jid) || [];
-  let allMessages, total, items;
-  if (search) {
-    // Search needs full scan — filter using cached lowercase text
-    const searchL = search.toLowerCase();
-    allMessages = [];
-    for (let i = rawMessages.length - 1; i >= 0; i--) {
-      const txt = getMessageSearchText(rawMessages[i]);
-      if (txt.includes(searchL)) allMessages.push(rawMessages[i]);
-    }
-    total = allMessages.length;
-    items = allMessages.slice(offset, offset + limit);
-  } else {
-    // No search: compute reverse window directly — O(limit) instead of O(M)
-    total = rawMessages.length;
-    const revStart = total - 1 - offset;
-    const revEnd = Math.max(-1, revStart - limit);
-    items = [];
-    for (let i = revStart; i > revEnd && i >= 0; i--) {
-      items.push(rawMessages[i]);
-    }
-  }
-  
-  const contact = contactStore.get(jid)
-  const chatName = contact?.name || contact?.notify || contact?.verifiedName || jidFriendly(jid)
-  const number = jidFriendly(jid)
-  const isGroup = jid.endsWith('@g.us')
-  
-  // Simple escaping for Nokia 7210
-  const esc = text => (text || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-  
-  // Simple truncate
-  const truncate = (text, maxLength) => {
-    if (!text) return ''
-    if (text.length <= maxLength) return text
-    return text.substring(0, maxLength - 3) + '...'
-  }
-  
-  // Simple timestamp for Nokia
-  const formatTime = (timestamp) => {
-    const date = new Date(Number(timestamp) * 1000)
-    if (isNaN(date.getTime())) return ''
-
-    const day = date.getDate().toString().padStart(2, '0')
-    const month = (date.getMonth() + 1).toString().padStart(2, '0')
-    const year = date.getFullYear()
-    const hours = date.getHours().toString().padStart(2, '0')
-    const mins = date.getMinutes().toString().padStart(2, '0')
-    const secs = date.getSeconds().toString().padStart(2, '0')
-
-    return `${day}/${month}/${year} ${hours}:${mins}:${secs}`
-  }
-  
-  let messageList = ''
-  
-  if (items.length === 0) {
-    messageList = '<p>No messages</p>'
-  } else {
-    messageList = items.map((m, idx) => {
-      const who = m.key.fromMe ? 'Me' : (chatName.length > 10 ? chatName.substring(0, 10) : chatName)
-      const time = formatTime(m.messageTimestamp)
-      const msgNumber = idx + 1
-      const mid = m.key.id
-      
-      // Handle different message types for Nokia
-      let text = ''
-      let mediaLink = ''
-      
-      if (m.message) {
-        if (m.message.imageMessage) {
-          const img = m.message.imageMessage
-          const size = Math.round((img.fileLength || 0) / 1024)
-          text = `[IMG ${size}KB]`
-          if (img.caption) text += ` ${truncate(img.caption, 30)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View IMG]</a>`
-          
-        } else if (m.message.videoMessage) {
-          const vid = m.message.videoMessage
-          const size = Math.round((vid.fileLength || 0) / 1024)
-          text = `[VID ${size}KB]`
-          if (vid.caption) text += ` ${truncate(vid.caption, 30)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View VID]</a>`
-          
-        } else if (m.message.audioMessage) {
-          const aud = m.message.audioMessage
-          const size = Math.round((aud.fileLength || 0) / 1024)
-          const duration = aud.seconds || 0
-          text = `[AUD ${size}KB ${duration}s]`
-          // Show transcription preview if available
-          if (m.transcription && m.transcription !== '[Trascrizione fallita]' && m.transcription !== '[Audio troppo lungo per la trascrizione]') {
-            text += `<br/><small>${truncate(m.transcription, 60)}</small>`
-          }
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View AUD]</a>` +
-            ` <a href="/wml/media/${encodeURIComponent(mid)}.mp3">[MP3]</a>` +
-            ` <a href="/wml/media/${encodeURIComponent(mid)}.amr">[AMR]</a>`
-          
-        } else if (m.message.documentMessage) {
-          const doc = m.message.documentMessage
-          const size = Math.round((doc.fileLength || 0) / 1024)
-          const filename = doc.fileName || 'file'
-          text = `[DOC ${size}KB] ${truncate(filename, 20)}`
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View DOC]</a>`
-          
-        } else if (m.message.stickerMessage) {
-          text = '[STICKER]'
-          mediaLink = `<br/><a href="/wml/media-info.wml?mid=${encodeURIComponent(mid)}&amp;jid=${encodeURIComponent(jid)}">[View STK]</a>`
-          
-        } else {
-          text = truncate(messageText(m) || '', 50)
-        }
-      } else {
-        text = truncate(messageText(m) || '', 50)
-      }
-      
-      return `<p>${msgNumber}. ${esc(who)} (${time})<br/>${esc(text)}${mediaLink}</p>`
-    }).join('')
-  }
-  
-  // Simple navigation for Nokia
-  const olderOffset = offset + limit
-  const olderLink = olderOffset < total ? 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${olderOffset}&amp;search=${encodeURIComponent(search)}" accesskey="2">2-Older</a></p>` : ''
-  
-  const newerOffset = Math.max(0, offset - limit)
-  const newerLink = offset > 0 ? 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;offset=${newerOffset}&amp;search=${encodeURIComponent(search)}" accesskey="3">3-Newer</a></p>` : ''
-  
-  // Simple search for Nokia
-  const searchBox = search ? 
-    `<p>Search: ${esc(search)}</p><p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}">Clear</a></p>` : 
-    `<p><a href="/wml/chat.wml?jid=${encodeURIComponent(jid)}&amp;search=prompt">Search</a></p>`
-  
-  const body = `<p>${esc(chatName.length > 15 ? chatName.substring(0, 15) : chatName)}</p>
-<p>Msgs ${offset + 1}-${Math.min(offset + limit, total)}/${total}</p>
-${searchBox}
-${messageList}
-${newerLink}
-${olderLink}
-<p><a href="/wml/send.text.wml?to=${encodeURIComponent(jid)}" accesskey="1">1-Send</a></p>
-<p><a href="/wml/chats.wml" accesskey="0">0-Back</a></p>`
-  
-  // Nokia 7210 compatible WML 1.1
-  const wmlOutput = `<?xml version="1.0"?>
-<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">
-<wml>
-<head><meta http-equiv="Cache-Control" content="no-cache, no-store"/></head>
-<card id="chat" title="Chat">
-${body}
-</card>
-</wml>`
-  
-  // Nokia 7210 headers
-  res.setHeader('Content-Type', 'text/vnd.wap.wml; charset=iso-8859-1')
-  res.setHeader('Cache-Control', 'no-cache')
-  res.setHeader('Pragma', 'no-cache')
-  
-  const encodedBuffer = iconv.encode(wmlOutput, 'iso-8859-1')
-  res.send(encodedBuffer)
-})*/
 // Enhanced Message Actions page
 app.get("/wml/msg.wml", (req, res) => {
   const mid = String(req.query.mid || "");
@@ -9594,8 +8949,9 @@ app.post("/wml/msg.react", async (req, res) => {
 app.get("/wml/msg.forward.wml", (req, res) => {
   const mid = req.query.mid || "";
   const search = (req.query.search || "").toLowerCase();
-  const page = parseInt(req.query.page || "1", 10);
-  const pageSize = 5;
+  const page = parsePage(req.query.page);
+  const tier = res.locals?.tier || detectTier(req);
+  const pageSize = tier === 'wml' ? 5 : (userSettings.paginationLimit || 10);
   const msg = messageStore.get(mid);
   if (!msg) {
     return sendWml(res, resultCard("Error", ["Message not found"], "/wml/home.wml"));
@@ -9679,7 +9035,16 @@ app.post("/wml/msg.delete", async (req, res) => {
     if (!sock) throw new Error("Not connected");
     const targetMessage = messageStore.get(mid);
     if (!targetMessage) throw new Error("Message not found");
-    await sock.sendMessage(formatJid(jid), { delete: targetMessage.key });
+
+    // WhatsApp only honors delete-for-everyone on messages you sent — calling it on a
+    // received message is a silent no-op on the wire, so don't claim it worked for everyone.
+    let resultMsg = "Message deleted for everyone";
+    if (targetMessage.key?.fromMe) {
+      await sock.sendMessage(formatJid(jid), { delete: targetMessage.key });
+    } else {
+      resultMsg = "Message removed here only (WhatsApp doesn't allow deleting messages you received, for everyone)";
+    }
+
     // Remove from local stores
     messageStore.delete(mid);
     const chatId = formatJid(jid);
@@ -9689,7 +9054,7 @@ app.post("/wml/msg.delete", async (req, res) => {
       if (idx !== -1) chatMessages.splice(idx, 1);
     }
     chatMessageIdSets.get(chatId)?.delete(mid);
-    sendWml(res, resultCard("Deleted", ["Message deleted"], `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=3`));
+    sendWml(res, resultCard("Deleted", [resultMsg], `/wml/chat.wml?jid=${encodeURIComponent(jid)}&limit=3`));
   } catch (e) {
     sendWml(res, resultCard("Error", [e.message || "Delete failed"], `/wml/msg.delete.wml?mid=${encodeURIComponent(mid)}&jid=${encodeURIComponent(jid)}`));
   }
@@ -9708,8 +9073,9 @@ app.get("/wml/msg.read.wml", (req, res) => {
 app.get("/wml/send-menu.wml", (req, res) => {
   const to = esc(req.query.to || "");
   const search = (req.query.search || "").toLowerCase();
-  const page = parseInt(req.query.page || "1", 10);
-  const pageSize = 3;
+  const page = parsePage(req.query.page);
+  const tier = res.locals?.tier || detectTier(req);
+  const pageSize = tier === 'wml' ? 3 : (userSettings.paginationLimit || 10);
   const contact = to
     ? contactStore.get(formatJid(to))
     : null;
@@ -10522,8 +9888,9 @@ app.get("/wml/sticker-pack.wml", (req, res) => {
   const to = esc(req.query.to || "");
   const packRaw = req.query.pack || "";
   const pack = packRaw.replace(/[^a-zA-Z0-9_\-]/g, "");
-  const page = Math.max(1, parseInt(req.query.page || "1", 10));
-  const pageSize = 5;
+  const page = parsePage(req.query.page);
+  const tier = res.locals?.tier || detectTier(req);
+  const pageSize = tier === 'wml' ? 5 : (userSettings.paginationLimit || 10);
 
   const packDir = path.join(STICKERS_DIR, pack);
   let stickers = [];
@@ -10645,7 +10012,7 @@ app.get("/wml/gif-results.wml", async (req, res) => {
   }
   const q = (req.query.q || "").trim();
   const trending = req.query.trending === "1";
-  const page = Math.max(1, parseInt(req.query.page || "1", 10));
+  const page = parsePage(req.query.page);
   const limit = 5;
   const offset = (page - 1) * limit;
 
@@ -10688,12 +10055,12 @@ app.get("/wml/gif-results.wml", async (req, res) => {
     if (totalPages > 1) {
       pagination = "<p>";
       if (page > 1) {
-        const prev = `/wml/gif-results.wml?q=${encodeURIComponent(q)}&to=${encodeURIComponent(req.query.to || "")}&page=${page - 1}${trending ? "&trending=1" : ""}`;
+        const prev = `/wml/gif-results.wml?q=${encodeURIComponent(q)}&amp;to=${encodeURIComponent(req.query.to || "")}&amp;page=${page - 1}${trending ? "&amp;trending=1" : ""}`;
         pagination += `<a href="${prev}">[Prev]</a> `;
       }
       pagination += `Pg ${page}/${totalPages}`;
       if (page < totalPages) {
-        const next = `/wml/gif-results.wml?q=${encodeURIComponent(q)}&to=${encodeURIComponent(req.query.to || "")}&page=${page + 1}${trending ? "&trending=1" : ""}`;
+        const next = `/wml/gif-results.wml?q=${encodeURIComponent(q)}&amp;to=${encodeURIComponent(req.query.to || "")}&amp;page=${page + 1}${trending ? "&amp;trending=1" : ""}`;
         pagination += ` <a href="${next}">[Next]</a>`;
       }
       pagination += "</p>";
@@ -11005,12 +10372,7 @@ app.post("/wml/send.image", async (req, res) => {
     if (!imageUrl || imageUrl === 'https://') throw new Error("No image URL provided");
 
     // O(N) — single HTTP GET, arraybuffer avoids string encoding overhead
-    const response = await axios.get(imageUrl, {
-      responseType: "arraybuffer",
-      timeout: 60000,
-      maxContentLength: 50 * 1024 * 1024,
-      maxBodyLength: 50 * 1024 * 1024
-    });
+    const response = await safeFetchUrl(imageUrl, { timeoutMs: 60000, maxBytes: 50 * 1024 * 1024 });
     // O(N) — Baileys encrypts + uploads to WhatsApp servers
     const result = await sock.sendMessage(formatJid(to), {
       image: response.data,
@@ -11034,12 +10396,7 @@ app.post("/wml/send.video", async (req, res) => {
     if (!videoUrl || videoUrl === 'https://') throw new Error("No video URL provided");
 
     // O(N) — single HTTP GET
-    const response = await axios.get(videoUrl, {
-      responseType: "arraybuffer",
-      timeout: 120000,
-      maxContentLength: 100 * 1024 * 1024,
-      maxBodyLength: 100 * 1024 * 1024
-    });
+    const response = await safeFetchUrl(videoUrl, { timeoutMs: 120000, maxBytes: 100 * 1024 * 1024 });
     // O(N) — direct buffer pass-through, no conversion
     const result = await sock.sendMessage(formatJid(to), {
       video: response.data,
@@ -11091,7 +10448,7 @@ app.post("/wml/send.tts", async (req, res) => {
         "Voice Message Sent",
         [
           `To: ${jidFriendly(to)}`,
-          `Text: "${text.substring(0, 50)}${text.length > 50 ? "..." : ""}"`,
+          `Text: "${safeSlice(text, 50)}${text.length > 50 ? "..." : ""}"`,
           `Language: ${language}`,
           `Type: ${ptt === "true" ? "Voice Note (PTT)" : "Audio File"}`,
           `ID: ${result?.key?.id || "Unknown"}`,
@@ -11120,12 +10477,7 @@ app.post("/wml/send.audio", async (req, res) => {
     if (!audioUrl || audioUrl === 'https://') throw new Error("No audio URL provided");
 
     // O(N) — single arraybuffer download, no intermediate string allocation
-    const response = await axios.get(audioUrl, {
-      responseType: "arraybuffer",
-      timeout: 60000,
-      maxContentLength: 50 * 1024 * 1024,
-      maxBodyLength: 50 * 1024 * 1024
-    });
+    const response = await safeFetchUrl(audioUrl, { timeoutMs: 60000, maxBytes: 50 * 1024 * 1024 });
     // O(N) — direct buffer pass-through to Baileys
     const result = await sock.sendMessage(formatJid(to), {
       audio: response.data,
@@ -11152,12 +10504,7 @@ app.post("/wml/send.document", async (req, res) => {
     if (!documentUrl || documentUrl === 'https://') throw new Error("No document URL provided");
 
     // O(N) — single arraybuffer download
-    const response = await axios.get(documentUrl, {
-      responseType: "arraybuffer",
-      timeout: 120000,
-      maxContentLength: 100 * 1024 * 1024,
-      maxBodyLength: 100 * 1024 * 1024
-    });
+    const response = await safeFetchUrl(documentUrl, { timeoutMs: 120000, maxBytes: 100 * 1024 * 1024 });
     // O(N) — direct buffer pass-through
     const result = await sock.sendMessage(formatJid(to), {
       document: response.data,
@@ -11258,12 +10605,7 @@ app.post("/wml/send.sticker", async (req, res) => {
 
       let rawBuf;
       try {
-        const response = await axios.get(url, {
-          responseType: "arraybuffer",
-          timeout: 60000,
-          maxContentLength: 10 * 1024 * 1024,
-          maxBodyLength: 10 * 1024 * 1024,
-        });
+        const response = await safeFetchUrl(url, { timeoutMs: 60000, maxBytes: 10 * 1024 * 1024 });
         rawBuf = Buffer.from(response.data);
         if (!rawBuf || rawBuf.length === 0) throw new Error("Empty response from URL");
       } catch (e) {
@@ -11351,9 +10693,9 @@ app.post("/wml/send.contact", async (req, res) => {
     const { to, contactName, phoneNumber, organization, email } = req.body;
     if (!sock) throw new Error("Not connected");
 
-    const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${contactName}\nTEL;type=CELL:${phoneNumber}\n${
-      organization ? `ORG:${organization}\n` : ""
-    }${email ? `EMAIL:${email}\n` : ""}END:VCARD`;
+    const vcard = `BEGIN:VCARD\nVERSION:3.0\nFN:${vcardEscape(contactName)}\nTEL;type=CELL:${vcardEscape(phoneNumber)}\n${
+      organization ? `ORG:${vcardEscape(organization)}\n` : ""
+    }${email ? `EMAIL:${vcardEscape(email)}\n` : ""}END:VCARD`;
 
     const result = await sock.sendMessage(formatJid(to), {
       contacts: {
@@ -11452,8 +10794,9 @@ app.get("/wml/groups.search.wml", async (req, res) => {
     if (!query) throw new Error("No search query provided");
 
     // Parametri di paginazione
-    const page = parseInt(req.query.page) || 1;
-    const limit = 3;
+    const page = parsePage(req.query.page);
+    const tier = res.locals?.tier || detectTier(req);
+    const limit = tier === 'wml' ? 3 : (userSettings.paginationLimit || 10);
     const offset = (page - 1) * limit;
 
     // Prendo tutti i gruppi e filtro per nome
@@ -11558,7 +10901,7 @@ app.get("/wml/groups.search.wml", async (req, res) => {
 <wml>
   <card id="error" title="Error">
     <p><b>Error:</b></p>
-    <p>${e.message || "Failed to search groups"}</p>
+    <p>${esc(e.message || "Failed to search groups")}</p>
     <p><a href="/wml/groups.wml">[Back to Groups]</a></p>
   </card>
 </wml>`;
@@ -11572,8 +10915,9 @@ app.get("/wml/groups.wml", async (req, res) => {
     if (!sock) throw new Error("Not connected");
 
     // Parametri di paginazione
-    const page = parseInt(req.query.page) || 1;
-    const limit = 3;
+    const page = parsePage(req.query.page);
+    const tier = res.locals?.tier || detectTier(req);
+    const limit = tier === 'wml' ? 3 : (userSettings.paginationLimit || 10);
     const offset = (page - 1) * limit;
 
     // PRODUCTION-GRADE: Check cache first for better performance
@@ -11632,7 +10976,7 @@ app.get("/wml/groups.wml", async (req, res) => {
         paginationControls += `<a href="/wml/groups.wml?page=1">[First]</a> `;
         paginationControls += `<a href="/wml/groups.wml?page=${
           page - 1
-        }">[&lt;]</a> `;
+        }" accesskey="7">[&lt;]</a> `;
       }
 
       const startPage = Math.max(1, page - 2);
@@ -11649,7 +10993,7 @@ app.get("/wml/groups.wml", async (req, res) => {
       if (page < totalPages) {
         paginationControls += `<a href="/wml/groups.wml?page=${
           page + 1
-        }">[&gt;]</a> `;
+        }" accesskey="8">[&gt;]</a> `;
         paginationControls += `<a href="/wml/groups.wml?page=${totalPages}">[Last]</a>`;
       }
 
@@ -11715,7 +11059,7 @@ app.get("/wml/groups.wml", async (req, res) => {
 <wml>
   <card id="error" title="Error">
     <p><b>Error:</b></p>
-    <p>${e.message || "Failed to load groups"}</p>
+    <p>${esc(e.message || "Failed to load groups")}</p>
     <p><a href="/wml/home.wml">[Back to Home]</a></p>
   </card>
 </wml>`;
@@ -11760,25 +11104,34 @@ app.get("/wml/group.view.wml", async (req, res) => {
         .replace(/'/g, "&apos;");
 
     // Pagination for participants
-    const page = parseInt(req.query.page) || 1;
-    const limit = 3; // 3 partecipanti per pagina
+    const page = parsePage(req.query.page);
+    const tier = res.locals?.tier || detectTier(req);
+    const limit = tier === 'wml' ? 3 : (userSettings.paginationLimit || 10);
     const offset = (page - 1) * limit;
     const totalPages = Math.ceil(participants.length / limit);
     const paginatedParticipants = participants.slice(offset, offset + limit);
 
-    // Participant list with LID support
-    const participantList = paginatedParticipants
-      .map((p, idx) => {
+    // Participant list with LID support — for @lid participants, resolve a real
+    // name/phone number via getContactWithLidSupport() (cached contact data, then
+    // Baileys' LID->PN mapping) instead of just showing the raw opaque LID.
+    const participantList = (await Promise.all(paginatedParticipants
+      .map(async (p, idx) => {
         const globalIdx = offset + idx;
         // Handle participant ID (could be LID or PN)
         const participantId = p.id;
-        const isLid = participantId.startsWith('lid:');
-        const displayName = isLid ? 
-          `LID:${participantId.substring(4)}` : 
-          jidFriendly(participantId);
+        const isLid = participantId.endsWith('@lid');
+        let displayName;
+        if (isLid) {
+          const resolved = await getContactWithLidSupport(participantId, sock);
+          const num = resolved?.displayNumber;
+          displayName = resolved?.name || resolved?.notify
+            || (num && !num.startsWith('LID:') ? `+${num}` : (num || `LID:${participantId.slice(0, -4)}`));
+        } else {
+          displayName = jidFriendly(participantId);
+        }
         const role = p.admin ? " (Admin)" : "";
         return `<p>${globalIdx + 1}. ${esc(displayName)}${role}</p>`;
-      })
+      })))
       .join("");
 
     // Pagination navigation
@@ -11926,43 +11279,62 @@ app.get("/wml/group.leave.wml", async (req, res) => {
     const gid = req.query.gid || "";
     if (!gid) throw new Error("No group ID provided");
 
-    const confirmed = req.query.confirm === "yes";
+    // Show confirmation page — the actual leave only happens on POST /wml/group.leave
+    const metadata = await sock.groupMetadata(gid);
+    const groupName = metadata.subject || "Unnamed Group";
 
-    if (!confirmed) {
-      // Show confirmation page
-      const metadata = await sock.groupMetadata(gid);
-      const groupName = metadata.subject || "Unnamed Group";
+    const body = `
+      <p><b>Leave Group?</b></p>
+      <p>Are you sure you want to leave:</p>
+      <p><b>${esc(groupName)}</b></p>
 
-      const body = `
-        <p><b>Leave Group?</b></p>
-        <p>Are you sure you want to leave:</p>
-        <p><b>${esc(groupName)}</b></p>
+      <p>
+        <anchor title="Leave">[1] Yes, Leave
+          <go method="post" href="/wml/group.leave">
+            <postfield name="gid" value="${esc(gid)}"/>
+          </go>
+        </anchor><br/>
+        <a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}" accesskey="0">[0] Cancel</a>
+      </p>
+      <do type="accept" label="Leave">
+        <go method="post" href="/wml/group.leave">
+          <postfield name="gid" value="${esc(gid)}"/>
+        </go>
+      </do>
+    `;
 
-        <p>
-          <a href="/wml/group.leave.wml?gid=${encodeURIComponent(gid)}&amp;confirm=yes" accesskey="1">[1] Yes, Leave</a><br/>
-          <a href="/wml/group.view.wml?gid=${encodeURIComponent(gid)}" accesskey="0">[0] Cancel</a>
-        </p>
-      `;
+    sendWml(res, card("leave-confirm", "Confirm", body));
+  } catch (e) {
+    const body = `
+      <p><b>Error</b></p>
+      <p>${esc(e.message || "Failed to leave group")}</p>
+      <p><a href="/wml/groups.wml">[Back to Groups]</a></p>
+    `;
+    sendWml(res, card("error", "Error", body));
+  }
+});
 
-      sendWml(res, card("leave-confirm", "Confirm", body));
-    } else {
-      // Execute leave - non-blocking
-      await sock.groupLeave(gid);
+app.post("/wml/group.leave", async (req, res) => {
+  const gid = req.body.gid || "";
+  try {
+    if (!sock) throw new Error("Not connected");
+    if (!gid) throw new Error("No group ID provided");
 
-      // Invalidate groups cache since we left a group
-      groupsCache.invalidate('all-groups');
+    await sock.groupLeave(gid);
 
-      const body = `
-        <p><b>Left Group</b></p>
-        <p>You have left the group successfully.</p>
-        <p>
-          <a href="/wml/groups.wml" accesskey="1">[1] All Groups</a><br/>
-          <a href="/wml/home.wml" accesskey="0">[0] Home</a>
-        </p>
-      `;
+    // Invalidate groups cache since we left a group
+    groupsCache.invalidate('all-groups');
 
-      sendWml(res, card("left", "Success", body));
-    }
+    const body = `
+      <p><b>Left Group</b></p>
+      <p>You have left the group successfully.</p>
+      <p>
+        <a href="/wml/groups.wml" accesskey="1">[1] All Groups</a><br/>
+        <a href="/wml/home.wml" accesskey="0">[0] Home</a>
+      </p>
+    `;
+
+    sendWml(res, card("left", "Success", body));
   } catch (e) {
     const body = `
       <p><b>Error</b></p>
@@ -12127,7 +11499,7 @@ app.post("/wml/status.text.action.wml", async (req, res) => {
       <p><small>${t('status_broadcast.broadcast_msg')}</small></p>
 
       <p><b>Preview:</b></p>
-      <p>${esc(text.substring(0, 100))}${text.length > 100 ? "..." : ""}</p>
+      <p>${esc(safeSlice(text, 100))}${text.length > 100 ? "..." : ""}</p>
 
       <p><small>ID: ${result?.key?.id?.slice(-8) || "Unknown"}</small></p>
 
@@ -12202,10 +11574,7 @@ app.post("/wml/status.image.action.wml", async (req, res) => {
     if (!url) throw new Error("Image URL is required");
 
     // Download image - async, non-blocking
-    const response = await axios.get(url, {
-      responseType: "arraybuffer",
-      timeout: 30000,
-    });
+    const response = await safeFetchUrl(url, { timeoutMs: 30000, maxBytes: 50 * 1024 * 1024 });
 
     const imageBuffer = Buffer.from(response.data);
 
@@ -12294,10 +11663,7 @@ app.post("/wml/status.video.action.wml", async (req, res) => {
     if (!url) throw new Error("Video URL is required");
 
     // Download video - async, non-blocking
-    const response = await axios.get(url, {
-      responseType: "arraybuffer",
-      timeout: 60000, // 60 seconds for larger videos
-    });
+    const response = await safeFetchUrl(url, { timeoutMs: 60000, maxBytes: 100 * 1024 * 1024 });
 
     const videoBuffer = Buffer.from(response.data);
 
@@ -12343,8 +11709,9 @@ app.get("/wml/search.results.wml", (req, res) => {
     limitParam === "all"
       ? Infinity
       : Math.max(1, Math.min(50, parseInt(limitParam)));
-  const page = Math.max(1, parseInt(req.query.page || "1"));
-  const pageSize = 3;
+  const page = parsePage(req.query.page);
+  const tier = res.locals?.tier || detectTier(req);
+  const pageSize = tier === 'wml' ? 3 : (userSettings.paginationLimit || 10);
   if (!q || q.length < 2) {
     sendWml(
       res,
@@ -12358,9 +11725,11 @@ app.get("/wml/search.results.wml", (req, res) => {
   }
   let allResults = [];
   const searchLower = q.toLowerCase();
-  // funzione sicura per troncare
+  // funzione sicura per troncare — per code point, per non spezzare le coppie surrogate (emoji)
   function truncate(str, n) {
-    return str && str.length > n ? str.slice(0, n) + "..." : str;
+    if (!str) return str;
+    const chars = Array.from(str);
+    return chars.length > n ? chars.slice(0, n).join('') + "..." : str;
   }
   // Funzione per formattare il timestamp
   function formatTimestamp(timestamp) {
@@ -12785,6 +12154,8 @@ app.post("/wml/send.text", async (req, res) => {
   try {
     if (!sock) throw new Error("Not connected");
     const { to, message } = req.body;
+    if (!to) throw new Error("No recipient specified");
+    if (!message || !message.trim()) throw new Error("Message cannot be empty");
     const result = await sock.sendMessage(formatJid(to), { text: message });
     sendWml(
       res,
@@ -12980,6 +12351,17 @@ async function connectWithBetterSync() {
     const oldSock = sock;
     sock = newSock;
 
+    // Clean up the previous socket's connection, listeners and timers so
+    // repeated reconnects don't leak WebSockets/handlers over the process lifetime.
+    if (oldSock) {
+      try {
+        oldSock.ev.removeAllListeners();
+        oldSock.end(new Error('Replaced by new connection'));
+      } catch (cleanupErr) {
+        logger.warn(`Error cleaning up previous socket: ${cleanupErr.message}`);
+      }
+    }
+
     // Initialize loadChatUtils dependencies NOW that sock is created
     initializeDependencies({
       logger: logger,
@@ -13061,43 +12443,55 @@ async function connectWithBetterSync() {
           // Log detailed disconnect reason
           logger.warn(`Connection closed - Status: ${statusCode}, Error: ${errorMessage}`);
 
-          // Only prevent reconnection on explicit logout
-          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+          const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+          const isBadSession = statusCode === DisconnectReason.badSession;
+          const isConnectionReplaced = statusCode === DisconnectReason.connectionReplaced;
 
-          logger.info(`Should reconnect: ${shouldReconnect}`);
-
-          if (shouldReconnect) {
-            // Aggressive reconnection with minimal delay
-            let delay = 2000; // Start with 2 seconds
-
-            // Only use exponential backoff after many failed attempts
-            if (syncAttempts > 5) {
-              delay = Math.min(3000 * Math.pow(1.5, syncAttempts - 5), 15000);
+          const saveDataBeforeTeardown = () => (async () => {
+            try {
+              await storage.saveImmediately("contacts", contactStore);
+              await storage.saveImmediately("chats", chatStore);
+              await storage.saveImmediately("messages", messageStore);
+              await storage.saveImmediately("meta", {
+                isFullySynced,
+                syncAttempts,
+                lastSync: new Date().toISOString(),
+                contactsCount: contactStore.size,
+                chatsCount: chatStore.size,
+                messagesCount: messageStore.size,
+              });
+              logger.info("✓ Data saved before teardown");
+            } catch (error) {
+              logger.error("❌ Failed to save before teardown:", error);
             }
+          })();
 
-            logger.info(`Reconnecting in ${delay}ms (attempt ${syncAttempts + 1})...`);
-            setTimeout(connectWithBetterSync, delay);
-          } else {
+          if (isConnectionReplaced) {
+            // Another connection took over this session (e.g. duplicate process/instance).
+            // Auto-reconnecting here would just fight the other connection for the socket —
+            // stay disconnected until the operator intervenes.
+            logger.error("Connection replaced by another session — NOT auto-reconnecting to avoid a reconnect war. Restart the server if this is unexpected.");
+            saveDataBeforeTeardown();
+            reconnectAttempts = 0;
+          } else if (isBadSession) {
+            // Local credentials are corrupted beyond repair (per Baileys). Retrying with the
+            // same auth state would just loop forever, so clear it and force a fresh QR/pairing.
+            logger.error("Bad session detected — clearing local auth credentials and requiring a fresh QR/pairing scan.");
+            saveDataBeforeTeardown();
+            try {
+              fs.rmSync("./auth_info_baileys", { recursive: true, force: true });
+            } catch (err) {
+              logger.error(`Failed to clear corrupted auth state: ${err.message}`);
+            }
+            isFullySynced = false;
+            syncAttempts = 0;
+            reconnectAttempts = 0;
+            clearQRFile();
+            setTimeout(connectWithBetterSync, 2000);
+          } else if (isLoggedOut) {
             // Save data IMMEDIATELY before logout
             logger.info("Saving all data before logout...");
-            (async () => {
-              try {
-                await storage.saveImmediately("contacts", contactStore);
-                await storage.saveImmediately("chats", chatStore);
-                await storage.saveImmediately("messages", messageStore);
-                await storage.saveImmediately("meta", {
-                  isFullySynced,
-                  syncAttempts,
-                  lastSync: new Date().toISOString(),
-                  contactsCount: contactStore.size,
-                  chatsCount: chatStore.size,
-                  messagesCount: messageStore.size,
-                });
-                logger.info("✓ Data saved on logout");
-              } catch (error) {
-                logger.error("❌ Failed to save on logout:", error);
-              }
-            })();
+            saveDataBeforeTeardown();
 
             // DO NOT clear stores - keep data persistent
             // contactStore.clear();
@@ -13105,13 +12499,28 @@ async function connectWithBetterSync() {
             // messageStore.clear();
             isFullySynced = false;
             syncAttempts = 0;
+            reconnectAttempts = 0;
             clearQRFile(); // Clear QR file on logout
+          } else {
+            // Transient disconnect (connectionLost, timedOut, restartRequired, network errors, etc.)
+            // Aggressive reconnection with minimal delay
+            let delay = 2000; // Start with 2 seconds
+
+            // Only use exponential backoff after many failed attempts
+            reconnectAttempts++;
+            if (reconnectAttempts > 5) {
+              delay = Math.min(3000 * Math.pow(1.5, reconnectAttempts - 5), 15000);
+            }
+
+            logger.info(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts})...`);
+            setTimeout(connectWithBetterSync, delay);
           }
         } else if (connection === "open") {
           logger.info("WhatsApp connected successfully!");
           isConnecting = false; // Connection established — allow future reconnections
           currentQR = null;
           currentPairingCode = null;
+          reconnectAttempts = 0;
           clearQRFile(); // Clear QR file when connected
 
           // Only reset isFullySynced if we don't have data from disk
@@ -13221,8 +12630,6 @@ async function connectWithBetterSync() {
       if (!message.key.fromMe && !message.messageStubType && message.message) {
         incrementUnreadCount(chatId);
       }
-      const participant = message.key.participantAlt || message.key.participant;
-
       // Maintain reverse index
       messageToChatIndex.set(message.key.id, chatId);
 
@@ -13600,7 +13007,7 @@ newSock.ev.on('lid-mapping.update', (update) => {
 
 async function getContactWithLidSupport(jid, sock) {
   // Check if it's a LID
-  if (jid.startsWith('lid:')) {
+  if (jid.endsWith('@lid')) {
     const contact = contactStore.get(jid);
     if (contact && contact.phoneNumber) {
       return {
@@ -13623,7 +13030,7 @@ async function getContactWithLidSupport(jid, sock) {
     }
     return {
       ...contact,
-      displayNumber: `LID:${jid.substring(4)}`
+      displayNumber: `LID:${jid.slice(0, -4)}`
     };
   }
   
@@ -13643,13 +13050,36 @@ async function getContactWithLidSupport(jid, sock) {
 // NOTE: gracefulShutdown is defined per-process in the cluster section below
 // (master handles worker lifecycle, workers handle data saving + connection cleanup)
 
+// Resuming after an uncaught exception risks continuing in a corrupted state
+// indefinitely, and silently defeats cluster's crash-and-auto-restart handling
+// (cluster.on('exit', ...) only fires if the worker process actually exits).
+// Only workers have anything above them to restart them (the master forks them);
+// the master itself has no supervisor, so crashing it would take the whole app
+// down with no recovery — for the master we keep the old log-and-continue behavior.
+async function crashAndRestart(label, err) {
+  logger.error(`${label}:`, err);
+  if (!cluster.isWorker) {
+    logger.error(`${label} in master process — logging and continuing (no supervisor would restart the master).`);
+    return;
+  }
+  logger.error(`${label} in worker — exiting so the master can restart it cleanly.`);
+  try {
+    await storage.saveImmediately("contacts", contactStore);
+    await storage.saveImmediately("chats", chatStore);
+    await storage.saveImmediately("messages", messageStore);
+  } catch (saveErr) {
+    logger.error("Failed to save data before crash-restart:", saveErr);
+  } finally {
+    process.exit(1);
+  }
+}
+
 process.on("uncaughtException", (error) => {
-  logger.error("Uncaught Exception:", error);
-  // Don't kill the process - log and continue to keep WhatsApp connection alive
+  crashAndRestart("Uncaught Exception", error);
 });
 
-process.on("unhandledRejection", (reason, promise) => {
-  logger.error("Unhandled Rejection at:", promise, "reason:", reason);
+process.on("unhandledRejection", (reason) => {
+  crashAndRestart("Unhandled Rejection", reason);
 });
 
 // Emergency save before process exit
@@ -13766,12 +13196,15 @@ if (cluster.isMaster || cluster.isPrimary) {
   let isShuttingDown = false;
   let masterShutdownTimer = null;
 
-  // Use 1 worker - WhatsApp socket lives in worker #1 and cannot be shared
+  // Fixed at 1 worker: the WhatsApp socket, contact/chat/message stores, and QR/pairing
+  // state all live as in-process module state in worker #1 — there's no IPC/shared-store
+  // layer, so a second worker would have no WhatsApp connection of its own. This is not
+  // tunable via WEB_CONCURRENCY or similar without that sharing layer first.
   const workers = 1;
 
   logger.info(`🚀 Master process ${process.pid} starting`);
-  logger.info(`💪 Spawning ${workers} worker processes (${numCPUs} CPUs available)`);
-  logger.info(`ℹ️  Using ${workers} workers - increase WEB_CONCURRENCY env var for heavy tasks (TTS, media conversion)`);
+  logger.info(`💪 Spawning ${workers} worker process (${numCPUs} CPUs available)`);
+  logger.info(`ℹ️  Fixed at ${workers} worker — the WhatsApp connection can't be shared across processes`);
 
   // Fork workers
   for (let i = 0; i < workers; i++) {
@@ -14537,13 +13970,21 @@ app.get("/api/qr", (req, res) => {
 });
 
 app.get("/api/qr/image", async (req, res) => {
-  const { format = "png" } = req.query;
+  // req.query.format can be an array (?format[]=x) or any non-string value under
+  // Express's query parser — coerce to a string so .toLowerCase() below can't throw.
+  const format = typeof req.query.format === "string" ? req.query.format : "png";
 
   if (!currentQR) {
     // Return a placeholder image instead of JSON to prevent "unknown response" errors
     const placeholderText = `No QR Code\nStatus: ${connectionState}\nPlease wait...`;
 
     try {
+      if (format === "wbmp") {
+        const wbmpBuffer = await qrToWbmp(placeholderText);
+        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
+        res.setHeader("Cache-Control", "no-cache");
+        return res.send(wbmpBuffer);
+      }
       // Generate a simple text-based QR placeholder
       const qrBuffer = await QRCode.toBuffer(placeholderText, {
         type: "png",
@@ -14555,7 +13996,7 @@ app.get("/api/qr/image", async (req, res) => {
         },
       });
 
-      res.setHeader("Content-Type", format === "wbmp" ? "image/vnd.wap.wbmp" : "image/png");
+      res.setHeader("Content-Type", "image/png");
       res.setHeader("Cache-Control", "no-cache");
       return res.send(qrBuffer);
     } catch (err) {
@@ -14571,32 +14012,19 @@ app.get("/api/qr/image", async (req, res) => {
 
   try {
     if (format.toLowerCase() === "wbmp") {
-      // Generate QR as WBMP format using qrcode library
+      // Generate a REAL WBMP (1-bit packed, WBMP-header) from the QR — the previous
+      // implementation sent PNG bytes mislabeled as image/vnd.wap.wbmp, which no real
+      // WAP 1.0 microbrowser can decode, breaking QR-based pairing for that tier entirely.
       try {
-        const qrBuffer = await QRCode.toBuffer(currentQR, {
-          type: "png",
-          width: 256,
-          margin: 2,
-          color: {
-            dark: "#000000",
-            light: "#FFFFFF",
-          },
-        });
-
-        // Convert PNG to simple WBMP-like format
-        // WBMP is a monochrome format, so we'll return the QR as minimal binary
+        const wbmpBuffer = await qrToWbmp(currentQR);
         res.setHeader("Content-Type", "image/vnd.wap.wbmp");
         res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
         res.setHeader("Cache-Control", "no-cache");
-
-        // Return the buffer (simplified WBMP representation)
-        res.send(qrBuffer);
+        res.send(wbmpBuffer);
       } catch (qrError) {
-        // Fallback: return raw QR string as WBMP
-        res.setHeader("Content-Type", "image/vnd.wap.wbmp");
-        res.setHeader("Content-Disposition", 'inline; filename="qr-code.wbmp"');
-        const qrBuffer = Buffer.from(currentQR, "utf8");
-        res.send(qrBuffer);
+        logger.error(`QR WBMP generation failed: ${qrError.message}`);
+        res.setHeader("Content-Type", "text/plain");
+        res.status(500).send("QR generation failed");
       }
     } else if (format.toLowerCase() === "base64") {
       // Return as base64 JSON response
@@ -14686,65 +14114,11 @@ app.get("/api/qr/wbmp", async (req, res) => {
   }
 
   try {
-    // Generate QR code as PNG first
-    const qrBuffer = await QRCode.toBuffer(currentQR, {
-      type: "png",
-      width: 200,
-      margin: 2,
-      color: {
-        dark: "#000000",
-        light: "#FFFFFF",
-      },
-    });
-
-    // Convert to WBMP - EXTREMELY small for very old phones (32x32 minimum)
-    const { data: pixels, info } = await sharp(qrBuffer)
-      .greyscale()
-      .resize(32, 32, {  // Tiny - 32x32 pixels (absolute minimum for old phones)
-        kernel: sharp.kernel.nearest,  // Preserves QR block patterns
-        fit: "contain",
-        position: "center",
-        background: { r: 255, g: 255, b: 255, alpha: 1 },
-      })
-      .threshold(128, { greyscale: true, grayscale: true })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-
-    // Create WBMP header
-    const width = info.width;
-    const height = info.height;
-    const header = Buffer.from([
-      0x00, // Type 0
-      0x00, // FixHeaderField
-      width,
-      height,
-    ]);
-
-    // Convert pixels to WBMP 1-bit format
-    // WBMP spec: 0 = black, 1 = white (inverted from usual bitmap)
-    const rowBytes = Math.ceil(width / 8);
-    const wbmpData = Buffer.alloc(rowBytes * height);
-
-    // Initialize all bits to 1 (white)
-    wbmpData.fill(0xFF);
-
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        const pixelIndex = y * width + x;
-        const pixel = pixels[pixelIndex];
-        const isBlack = pixel < 128;
-
-        if (isBlack) {
-          // Set bit to 0 for black pixels
-          const byteIndex = y * rowBytes + Math.floor(x / 8);
-          const bitIndex = 7 - (x % 8);
-          wbmpData[byteIndex] &= ~(1 << bitIndex);
-        }
-      }
-    }
-
-    const wbmpBuffer = Buffer.concat([header, wbmpData]);
-
+    // Reuse the shared createWBMP()-based helper (proper multi-byte header, the
+    // codebase's single agreed-upon bit polarity) instead of a fourth hand-rolled
+    // encoder — this one both had the single-byte-header bug (breaks >=128px) and
+    // used the opposite bit polarity from every other WBMP writer in the file.
+    const wbmpBuffer = await qrToWbmp(currentQR, 32); // tiny, for very old phones
     res.setHeader("Content-Type", "image/vnd.wap.wbmp");
     res.setHeader("Cache-Control", "no-cache");
     res.send(wbmpBuffer);
@@ -14807,14 +14181,16 @@ app.get("/wml/qr-wap.wml", (req, res) => {
     return sendWml(res, card("qr-wap", "QR WAP", body));
   }
 
-  // Detect old WAP phones vs modern browsers
-  const ua = (req.headers['user-agent'] || '').toLowerCase();
-  const isOldPhone = ua.includes('nokia') || ua.includes('up.browser') || ua.includes('openwave') || ua.includes('mot-') || ua.includes('sie-') || ua.includes('sam-') || ua.includes('sec-') || ua.includes('series40');
-  const qrSize = isOldPhone ? 60 : 200;
+  // Real WAP 1.0 microbrowsers generally can't decode PNG at all — WBMP is the
+  // format they actually support, which is why /api/qr/image?format=wbmp exists.
+  // xhtml/html5 tiers get a bigger, sharper PNG since they can render it natively.
+  const tier = res.locals?.tier || detectTier(req);
+  const qrFormat = tier === 'wml' ? 'wbmp' : 'png';
+  const qrSize = tier === 'wml' ? 60 : 200;
 
   const body = `
     <p align="center">
-      <img src="/api/qr/image?format=png" alt="QR Code" width="${qrSize}" height="${qrSize}"/>
+      <img src="/api/qr/image?format=${qrFormat}" alt="QR Code" width="${qrSize}" height="${qrSize}"/>
     </p>
     <p align="center"><a href="/wml/qr-wap.wml">${t('qr.refresh')}</a> | <a href="/wml/qr.wml">${t('common.back')}</a></p>
     <do type="accept" label="${t('common.refresh')}">
@@ -14984,7 +14360,8 @@ app.get("/api/me", async (req, res) => {
     const profilePic = await sock
       .profilePictureUrl(sock.user.id)
       .catch(() => null);
-    const status = await sock.fetchStatus(sock.user.id).catch(() => null);
+    const statusResults = await sock.fetchStatus(sock.user.id).catch(() => null);
+    const status = statusResults?.[0]?.status || null;
 
     res.json({
       user: sock.user,
@@ -15029,8 +14406,9 @@ app.post("/api/update-profile-picture", async (req, res) => {
   try {
     const { imageUrl } = req.body;
     if (!sock) return res.status(500).json({ error: "Not connected" });
+    if (!imageUrl) return res.status(400).json({ error: "imageUrl is required" });
 
-    const response = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    const response = await safeFetchUrl(imageUrl, { timeoutMs: 30000, maxBytes: 10 * 1024 * 1024 });
     await sock.updateProfilePicture(sock.user.id, response.data);
     res.json({ status: "Profile picture updated" });
   } catch (error) {
@@ -15089,11 +14467,13 @@ app.get("/api/contacts/all", async (req, res) => {
         paginatedContacts.map(async (contact) => {
           try {
             // Run all 3 API calls in parallel for this contact
-            const [profilePic, status, businessProfile] = await Promise.all([
+            const [profilePic, statusResults, businessProfile] = await Promise.all([
               sock.profilePictureUrl(contact.id, "image").catch(() => null),
               sock.fetchStatus(contact.id).catch(() => null),
               sock.getBusinessProfile(contact.id).catch(() => null),
             ]);
+            // fetchStatus is variadic and returns one {id, status:{status,setAt}} entry per jid queried
+            const status = statusResults?.[0]?.status || null;
 
             return {
               id: contact.id,
@@ -15311,7 +14691,9 @@ app.get("/api/chat/by-number/:number", async (req, res) => {
 
     const contact = contactStore.get(jid);
     const profilePic = await sock.profilePictureUrl(jid).catch(() => null);
-    const status = await sock.fetchStatus(jid).catch(() => null);
+    // fetchStatus is variadic and returns one {id, status:{status,setAt}} entry per jid queried
+    const statusResults = await sock.fetchStatus(jid).catch(() => null);
+    const status = statusResults?.[0]?.status || null;
 
     // Pagination
     const startIndex = Math.max(
@@ -15538,7 +14920,9 @@ app.get("/api/contacts", async (req, res) => {
         const profilePic = await sock
           .profilePictureUrl(contact.id, "image")
           .catch(() => null);
-        const status = await sock.fetchStatus(contact.id).catch(() => null);
+        // fetchStatus is variadic and returns one {id, status:{status,setAt}} entry per jid queried
+        const statusResults = await sock.fetchStatus(contact.id).catch(() => null);
+        const status = statusResults?.[0]?.status || null;
 
         enrichedContacts.push({
           id: contact.id,
@@ -15725,7 +15109,9 @@ app.get("/api/contact/:jid", async (req, res) => {
 
     try {
       profilePic = await sock.profilePictureUrl(formattedJid).catch(() => null);
-      status = await sock.fetchStatus(formattedJid).catch(() => null);
+      // fetchStatus is variadic and returns one {id, status:{status,setAt}} entry per jid queried
+      const statusResults = await sock.fetchStatus(formattedJid).catch(() => null);
+      status = statusResults?.[0]?.status || null;
       businessProfile = await sock.getBusinessProfile(formattedJid).catch(() => null);
     } catch (e) {
       // Silent fail for optional features
@@ -15736,7 +15122,6 @@ app.get("/api/contact/:jid", async (req, res) => {
       profilePicture: profilePic,
       status: status?.status,
       businessProfile,
-      addressingMode: sock.getMessageAddressingMode(formattedJid),
       syncInfo: { isFullySynced, syncAttempts },
     });
   } catch (error) {
@@ -15778,7 +15163,7 @@ app.post("/api/check-numbers", async (req, res) => {
     for (const number of numbers) {
       try {
         // Check if it's a LID - skip onWhatsApp for LIDs
-        const isLid = number.startsWith('lid:');
+        const isLid = number.endsWith('@lid');
 
         if (isLid) {
           // LIDs cannot be checked with onWhatsApp
@@ -15791,8 +15176,8 @@ app.post("/api/check-numbers", async (req, res) => {
           // Clean the number - remove non-digits and plus
           const cleanedNumber = number.replace(/\D/g, '');
 
-          // Use cleaned number directly (no domain)
-          const exists = await sock.onWhatsApp([cleanedNumber]);
+          // Use cleaned number directly (no domain) — onWhatsApp is variadic, not array-arg
+          const exists = await sock.onWhatsApp(cleanedNumber);
 
           results.push({
             number,
@@ -15834,7 +15219,7 @@ app.post("/api/send-image", async (req, res) => {
     const { to, imageUrl, caption } = req.body;
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
-    const response = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    const response = await safeFetchUrl(imageUrl, { timeoutMs: 60000, maxBytes: 50 * 1024 * 1024 });
     const result = await sock.sendMessage(formatJid(to), {
       image: response.data,
       caption,
@@ -15850,7 +15235,7 @@ app.post("/api/send-video", async (req, res) => {
     const { to, videoUrl, caption } = req.body;
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
-    const response = await axios.get(videoUrl, { responseType: "arraybuffer" });
+    const response = await safeFetchUrl(videoUrl, { timeoutMs: 120000, maxBytes: 100 * 1024 * 1024 });
     const result = await sock.sendMessage(formatJid(to), {
       video: response.data,
       caption,
@@ -15866,7 +15251,7 @@ app.post("/api/send-audio", async (req, res) => {
     const { to, audioUrl, ptt = false } = req.body;
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
-    const response = await axios.get(audioUrl, { responseType: "arraybuffer" });
+    const response = await safeFetchUrl(audioUrl, { timeoutMs: 60000, maxBytes: 50 * 1024 * 1024 });
     const result = await sock.sendMessage(formatJid(to), {
       audio: response.data,
       ptt,
@@ -15883,12 +15268,7 @@ app.post("/api/send-document", async (req, res) => {
     const { to, documentUrl, fileName, mimetype } = req.body;
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
-    const response = await axios.get(documentUrl, {
-      responseType: "arraybuffer",
-      timeout: 120000, // 120 second timeout for documents
-      maxContentLength: 100 * 1024 * 1024, // 100MB max
-      maxBodyLength: 100 * 1024 * 1024
-    });
+    const response = await safeFetchUrl(documentUrl, { timeoutMs: 120000, maxBytes: 100 * 1024 * 1024 });
     const result = await sock.sendMessage(formatJid(to), {
       document: response.data,
       fileName: fileName || "document",
@@ -15905,7 +15285,7 @@ app.post("/api/send-sticker", async (req, res) => {
     const { to, imageUrl } = req.body;
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
-    const response = await axios.get(imageUrl, { responseType: "arraybuffer" });
+    const response = await safeFetchUrl(imageUrl, { timeoutMs: 30000, maxBytes: 10 * 1024 * 1024 });
     const result = await sock.sendMessage(formatJid(to), {
       sticker: response.data,
     });
@@ -15941,7 +15321,7 @@ app.post("/api/send-contact", async (req, res) => {
     const contactList = Array.isArray(contacts) ? contacts : [contacts];
     const vCards = contactList.map((contact) => ({
       displayName: contact.name,
-      vcard: `BEGIN:VCARD\nVERSION:3.0\nFN:${contact.name}\nTEL;type=CELL:${contact.number}\nEND:VCARD`,
+      vcard: `BEGIN:VCARD\nVERSION:3.0\nFN:${vcardEscape(contact.name)}\nTEL;type=CELL:${vcardEscape(contact.number)}\nEND:VCARD`,
     }));
 
     const result = await sock.sendMessage(formatJid(to), {
@@ -16034,7 +15414,9 @@ app.post("/api/forward-message", async (req, res) => {
 
     for (const recipient of recipients) {
       try {
-        const result = await sock.relayMessage(
+        // relayMessage resolves to the message-ID string directly (unlike
+        // sendMessage, which resolves to a WAMessage with a .key.id path).
+        const messageId = await sock.relayMessage(
           formatJid(recipient),
           targetMessage.message,
           {}
@@ -16042,7 +15424,7 @@ app.post("/api/forward-message", async (req, res) => {
         results.push({
           recipient: formatJid(recipient),
           status: "sent",
-          messageId: result.key.id,
+          messageId,
         });
       } catch (error) {
         results.push({
@@ -16159,10 +15541,8 @@ app.post("/api/group/:groupId/participants", async (req, res) => {
 
     // Participants can now be LIDs or PNs
     const participantJids = participants.map(jid => {
-      // If it's already a JID (with domain), use as-is
+      // If it's already a JID (with domain) — including LIDs, which are "<digits>@lid" — use as-is
       if (jid.includes('@')) return jid;
-      // If it's a LID, use as-is
-      if (jid.startsWith('lid:')) return jid;
       // Otherwise, format as phone number
       return formatJid(jid);
     });
@@ -16205,13 +15585,20 @@ app.post("/api/group/:groupId/description", async (req, res) => {
   }
 });
 
+// Baileys' groupSettingUpdate(jid, setting) takes ONE enum string that encodes
+// both the setting and its value — there's no separate value parameter.
+const GROUP_SETTING_VALUES = new Set(['announcement', 'not_announcement', 'locked', 'unlocked']);
+
 app.post("/api/group/:groupId/settings", async (req, res) => {
   try {
     const { groupId } = req.params;
-    const { setting, value } = req.body;
+    const { setting } = req.body;
     if (!sock) return res.status(500).json({ error: "Not connected" });
+    if (!GROUP_SETTING_VALUES.has(setting)) {
+      return res.status(400).json({ error: `setting must be one of: ${[...GROUP_SETTING_VALUES].join(', ')}` });
+    }
 
-    await sock.groupSettingUpdate(groupId, setting, value);
+    await sock.groupSettingUpdate(groupId, setting);
     res.json({ status: "ok" });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -16305,6 +15692,20 @@ app.post("/api/download-media", async (req, res) => {
   }
 });
 
+// Baileys exposes privacy settings as separate per-category methods (there is no
+// single updatePrivacySettings()) — this maps the category name fetchPrivacySettings()
+// returns (and that WhatsApp's own protocol uses) to the method that updates it.
+const PRIVACY_SETTING_METHODS = {
+  last: 'updateLastSeenPrivacy',
+  online: 'updateOnlinePrivacy',
+  profile: 'updateProfilePicturePrivacy',
+  status: 'updateStatusPrivacy',
+  readreceipts: 'updateReadReceiptsPrivacy',
+  groupadd: 'updateGroupsAddPrivacy',
+  calladd: 'updateCallPrivacy',
+  messages: 'updateMessagesPrivacy',
+};
+
 app.get("/api/privacy", async (req, res) => {
   try {
     if (!sock) return res.status(500).json({ error: "Not connected" });
@@ -16321,7 +15722,12 @@ app.post("/api/privacy", async (req, res) => {
     const { setting, value } = req.body;
     if (!sock) return res.status(500).json({ error: "Not connected" });
 
-    await sock.updatePrivacySettings({ [setting]: value });
+    // Baileys has no single updatePrivacySettings() — each category is its own method.
+    const method = PRIVACY_SETTING_METHODS[setting];
+    if (!method || typeof sock[method] !== 'function') {
+      return res.status(400).json({ error: `Unknown privacy setting: ${setting}` });
+    }
+    await sock[method](value);
     res.json({ status: "ok" });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -16338,14 +15744,10 @@ app.post("/api/send-status", async (req, res) => {
     if (type === "text") {
       statusMessage = { text: content };
     } else if (type === "image") {
-      const response = await axios.get(content, {
-        responseType: "arraybuffer",
-      });
+      const response = await safeFetchUrl(content, { timeoutMs: 30000, maxBytes: 50 * 1024 * 1024 });
       statusMessage = { image: response.data };
     } else if (type === "video") {
-      const response = await axios.get(content, {
-        responseType: "arraybuffer",
-      });
+      const response = await safeFetchUrl(content, { timeoutMs: 60000, maxBytes: 100 * 1024 * 1024 });
       statusMessage = { video: response.data };
     }
 
@@ -16410,7 +15812,9 @@ app.get("/wml/me.wml", async (req, res) => {
     let status = null;
 
     try {
-      status = await sock.fetchStatus(user.id).catch(() => null);
+      // fetchStatus is variadic and returns one {id, status:{status,setAt}} entry per jid queried
+      const statusResults = await sock.fetchStatus(user.id).catch(() => null);
+      status = statusResults?.[0]?.status || null;
     } catch (e) {
       // Silent fail for optional features
     }
@@ -16437,9 +15841,9 @@ app.get("/wml/me.wml", async (req, res) => {
 
       <p><b>${t('profile.actions')}</b></p>
       <p>
-        <a href="/wml/profile.edit-name.wml" accesskey="1">${t('profile.edit_name')}</a><br/>
-        <a href="/wml/profile.edit-status.wml" accesskey="2">${t('profile.edit_status')}</a><br/>
-        <a href="/wml/profile.picture.wml" accesskey="3">${t('profile.view_picture')}</a><br/>
+        <a href="/wml/profile.edit-name.wml" accesskey="5">${t('profile.edit_name')}</a><br/>
+        <a href="/wml/profile.edit-status.wml" accesskey="6">${t('profile.edit_status')}</a><br/>
+        <a href="/wml/profile.picture.wml" accesskey="7">${t('profile.view_picture')}</a><br/>
       </p>
 
       <p><b>${t('profile.account_info')}</b></p>
@@ -16558,7 +15962,9 @@ app.get("/wml/profile.edit-status.wml", async (req, res) => {
     let currentStatus = "Loading...";
 
     try {
-      const status = await sock.fetchStatus(user.id);
+      // fetchStatus is variadic and returns one {id, status:{status,setAt}} entry per jid queried
+      const statusResults = await sock.fetchStatus(user.id);
+      const status = statusResults?.[0]?.status;
       currentStatus = status?.status || "No status set";
     } catch (e) {
       currentStatus = "Could not load status";
@@ -17022,7 +16428,7 @@ app.get("/wml/presence.wml", (req, res) => {
       </go>
     </do>
 
-    ${navigationBar()}
+    ${navigationBar(false)}
   `;
 
   sendWml(res, card("presence", "Presence", body));
@@ -17054,10 +16460,10 @@ app.get("/wml/privacy.wml", async (req, res) => {
         privacySettings
           ? `
       <p><b>Current Settings:</b></p>
-      <p>Last Seen: ${esc(privacySettings.lastSeen || "Unknown")}</p>
-      <p>Profile Photo: ${esc(privacySettings.profilePicture || "Unknown")}</p>
+      <p>Last Seen: ${esc(privacySettings.last || "Unknown")}</p>
+      <p>Profile Photo: ${esc(privacySettings.profile || "Unknown")}</p>
       <p>Status: ${esc(privacySettings.status || "Unknown")}</p>
-      <p>Read Receipts: ${esc(privacySettings.readReceipts || "Unknown")}</p>
+      <p>Read Receipts: ${esc(privacySettings.readreceipts || "Unknown")}</p>
       `
           : "<p><em>Privacy settings unavailable</em></p>"
       }
@@ -17077,8 +16483,8 @@ app.get("/wml/privacy.wml", async (req, res) => {
         <a href="/wml/block.contact.wml" accesskey="8">${t('privacy.block_contact')}</a><br/>
       </p>
       
-      ${navigationBar()}
-      
+      ${navigationBar(false)}
+
       <do type="accept" label="${t('common.refresh')}">
         <go href="/wml/privacy.wml"/>
       </do>
@@ -17105,8 +16511,9 @@ app.get("/wml/blocked.list.wml", async (req, res) => {
       return sendWml(res, resultCard(t('common.error'), [t('privacy.not_connected')], "/wml/privacy.wml"));
     }
     const blocklist = await sock.fetchBlocklist();
-    const page = parseInt(req.query.page || "1", 10);
-    const pageSize = 5;
+    const page = parsePage(req.query.page);
+    const tier = res.locals?.tier || detectTier(req);
+    const pageSize = tier === 'wml' ? 5 : (userSettings.paginationLimit || 10);
     const totalPages = Math.max(1, Math.ceil((blocklist.length || 0) / pageSize));
     const pageItems = (blocklist || []).slice((page - 1) * pageSize, page * pageSize);
     const listHtml = pageItems.length
@@ -17174,7 +16581,7 @@ app.get("/wml/privacy.receipts.wml", async (req, res) => {
     let current = "unknown";
     try {
       const privacy = await sock.fetchPrivacySettings();
-      current = privacy.readReceipts || "all";
+      current = privacy.readreceipts || "all";
     } catch (e) { /* silent */ }
     const body = `
       <p><b>Read Receipts</b></p>
@@ -17209,8 +16616,8 @@ app.post("/wml/privacy.receipts", async (req, res) => {
   const { value } = req.body;
   try {
     if (!sock) throw new Error("Not connected");
-    await sock.updatePrivacySettings({ readReceipts: value });
-    sendWml(res, resultCard("Saved", [`Read receipts set to: ${esc(value)}`], "/wml/privacy.wml"));
+    await sock.updateReadReceiptsPrivacy(value);
+    sendWml(res, resultCard("Saved", [`Read receipts set to: ${value}`], "/wml/privacy.wml"));
   } catch (e) {
     sendWml(res, resultCard("Error", [e.message || "Update failed"], "/wml/privacy.receipts.wml"));
   }
@@ -17234,7 +16641,6 @@ app.get("/wml/privacy.groups.wml", async (req, res) => {
         <option value="all">Everyone</option>
         <option value="contacts">My Contacts</option>
         <option value="contact_blacklist">My Contacts Except</option>
-        <option value="none">Nobody</option>
       </select>
       <p>
         <anchor title="Save">Save
@@ -17260,16 +16666,132 @@ app.post("/wml/privacy.groups", async (req, res) => {
   const { value } = req.body;
   try {
     if (!sock) throw new Error("Not connected");
-    await sock.updatePrivacySettings({ groupadd: value });
-    sendWml(res, resultCard("Saved", [`Groups privacy set to: ${esc(value)}`], "/wml/privacy.wml"));
+    await sock.updateGroupsAddPrivacy(value);
+    sendWml(res, resultCard("Saved", [`Groups privacy set to: ${value}`], "/wml/privacy.wml"));
   } catch (e) {
     sendWml(res, resultCard("Error", [e.message || "Update failed"], "/wml/privacy.groups.wml"));
+  }
+});
+
+// Shared markup for the three WAPrivacyValue-based settings (last seen, profile
+// photo, status) — same option domain ('all'/'contacts'/'contact_blacklist'/'none'),
+// only the label, current-value key, and update method differ.
+function privacySelectPage(label, current, saveAction) {
+  return `
+    <p><b>${esc(label)}</b></p>
+    <p>Current: ${esc(current)}</p>
+    <p>Choose setting:</p>
+    <select name="value" title="${esc(label)}">
+      <option value="all">Everyone</option>
+      <option value="contacts">My Contacts</option>
+      <option value="contact_blacklist">My Contacts Except</option>
+      <option value="none">Nobody</option>
+    </select>
+    <p>
+      <anchor title="Save">Save
+        <go method="post" href="${saveAction}">
+          <postfield name="value" value="$(value)"/>
+        </go>
+      </anchor>
+    </p>
+    <do type="accept" label="${t('common.save')}">
+      <go method="post" href="${saveAction}">
+        <postfield name="value" value="$(value)"/>
+      </go>
+    </do>
+    <p><a href="/wml/privacy.wml" accesskey="0">[0] Back</a></p>
+  `;
+}
+
+app.get("/wml/privacy.lastseen.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      return sendWml(res, resultCard("Error", ["Not connected"], "/wml/privacy.wml"));
+    }
+    let current = "unknown";
+    try {
+      const privacy = await sock.fetchPrivacySettings();
+      current = privacy.last || "all";
+    } catch (e) { /* silent */ }
+    sendWml(res, card("privacy-lastseen", "Last Seen", privacySelectPage("Last Seen", current, "/wml/privacy.lastseen")));
+  } catch (e) {
+    sendWml(res, resultCard("Error", [e.message || "Failed"], "/wml/privacy.wml"));
+  }
+});
+
+app.post("/wml/privacy.lastseen", async (req, res) => {
+  const { value } = req.body;
+  try {
+    if (!sock) throw new Error("Not connected");
+    await sock.updateLastSeenPrivacy(value);
+    sendWml(res, resultCard("Saved", [`Last seen privacy set to: ${value}`], "/wml/privacy.wml"));
+  } catch (e) {
+    sendWml(res, resultCard("Error", [e.message || "Update failed"], "/wml/privacy.lastseen.wml"));
+  }
+});
+
+app.get("/wml/privacy.profile.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      return sendWml(res, resultCard("Error", ["Not connected"], "/wml/privacy.wml"));
+    }
+    let current = "unknown";
+    try {
+      const privacy = await sock.fetchPrivacySettings();
+      current = privacy.profile || "all";
+    } catch (e) { /* silent */ }
+    sendWml(res, card("privacy-profile", "Profile Photo", privacySelectPage("Profile Photo", current, "/wml/privacy.profile")));
+  } catch (e) {
+    sendWml(res, resultCard("Error", [e.message || "Failed"], "/wml/privacy.wml"));
+  }
+});
+
+app.post("/wml/privacy.profile", async (req, res) => {
+  const { value } = req.body;
+  try {
+    if (!sock) throw new Error("Not connected");
+    await sock.updateProfilePicturePrivacy(value);
+    sendWml(res, resultCard("Saved", [`Profile photo privacy set to: ${value}`], "/wml/privacy.wml"));
+  } catch (e) {
+    sendWml(res, resultCard("Error", [e.message || "Update failed"], "/wml/privacy.profile.wml"));
+  }
+});
+
+app.get("/wml/privacy.status.wml", async (req, res) => {
+  try {
+    if (!sock) {
+      return sendWml(res, resultCard("Error", ["Not connected"], "/wml/privacy.wml"));
+    }
+    let current = "unknown";
+    try {
+      const privacy = await sock.fetchPrivacySettings();
+      current = privacy.status || "all";
+    } catch (e) { /* silent */ }
+    sendWml(res, card("privacy-status", "Status Privacy", privacySelectPage("Status Privacy", current, "/wml/privacy.status")));
+  } catch (e) {
+    sendWml(res, resultCard("Error", [e.message || "Failed"], "/wml/privacy.wml"));
+  }
+});
+
+app.post("/wml/privacy.status", async (req, res) => {
+  const { value } = req.body;
+  try {
+    if (!sock) throw new Error("Not connected");
+    await sock.updateStatusPrivacy(value);
+    sendWml(res, resultCard("Saved", [`Status privacy set to: ${value}`], "/wml/privacy.wml"));
+  } catch (e) {
+    sendWml(res, resultCard("Error", [e.message || "Update failed"], "/wml/privacy.status.wml"));
   }
 });
 
 // =================== POST HANDLERS FOR QUICK ACTIONS ===================
 
 // Presence setting handler
+// Matches Baileys' WAPresence type exactly — sendPresenceUpdate builds and sends a
+// WhatsApp stanza rather than validating locally, so an invalid type wouldn't throw
+// (nothing to catch) and would just silently send a malformed presence update.
+const PRESENCE_TYPES = new Set(['unavailable', 'available', 'composing', 'recording', 'paused']);
+
 app.post("/wml/presence.set", async (req, res) => {
   try {
     const { jid, presence = "available" } = req.body;
@@ -17283,6 +16805,14 @@ app.post("/wml/presence.set", async (req, res) => {
       return;
     }
 
+    if (!PRESENCE_TYPES.has(type)) {
+      sendWml(
+        res,
+        resultCard("Error", [`Invalid presence type: ${type}`], "/wml/presence.wml")
+      );
+      return;
+    }
+
     if (jid && jid.trim()) {
       await sock.sendPresenceUpdate(type, formatJid(jid.trim()));
       sendWml(
@@ -17290,7 +16820,7 @@ app.post("/wml/presence.set", async (req, res) => {
         resultCard(
           "Presence Updated",
           [
-            `Set ${type} for ${esc(jid.trim())}`,
+            `Set ${type} for ${jid.trim()}`,
             "Presence updated successfully",
           ],
           "/wml/presence.wml",
@@ -17334,6 +16864,14 @@ app.get("/wml/presence.set.wml", async (req, res) => {
       return;
     }
 
+    if (!PRESENCE_TYPES.has(type)) {
+      sendWml(
+        res,
+        resultCard("Error", [`Invalid presence type: ${type}`], "/wml/presence.wml")
+      );
+      return;
+    }
+
     if (jid && jid.trim()) {
       await sock.sendPresenceUpdate(type, formatJid(jid.trim()));
       sendWml(
@@ -17341,7 +16879,7 @@ app.get("/wml/presence.set.wml", async (req, res) => {
         resultCard(
           "Presence Updated",
           [
-            `Set ${type} for ${esc(jid.trim())}`,
+            `Set ${type} for ${jid.trim()}`,
             "Presence updated successfully",
           ],
           "/wml/presence.wml",
@@ -17480,9 +17018,9 @@ app.get("/wml/debug.wml", (req, res) => {
     
     <p><b>Debug Actions:</b></p>
     <p>
-      <a href="/wml/debug.stores.wml" accesskey="1">[1] Store Details</a><br/>
-      <a href="/wml/debug.logs.wml" accesskey="2">[2] Recent Logs</a><br/>
-      <a href="/wml/debug.test.wml" accesskey="3">[3] Connection Test</a><br/>
+      <a href="/wml/debug.stores.wml" accesskey="5">[5] Store Details</a><br/>
+      <a href="/wml/debug.logs.wml" accesskey="6">[6] Recent Logs</a><br/>
+      <a href="/wml/debug.test.wml" accesskey="7">[7] Connection Test</a><br/>
     </p>
     
     ${navigationBar()}
@@ -17763,19 +17301,14 @@ app.get("/wml/sync.contacts.wml", async (req, res) => {
 
 // Enhanced Chats page with search and pagination
 app.get("/wml/chats.wml", async (req, res) => {
-  const userAgent = req.headers["user-agent"] || "";
-
   // Use req.query for GET requests, like in contacts
   const query = req.query;
 
   const page = Math.max(1, parseInt(query.page || "1"));
-  let limit = 3; // Fisso a 3 elementi per pagina
-
-  // More restrictive limits for WAP 1.0 devices (like contacts)
-  if (userAgent.includes("Nokia") || userAgent.includes("UP.Browser")) {
-    limit = Math.min(3, limit); // Max 3 items per page
-  }
-  limit = Math.min(3, limit); // Max 3 items per page
+  // WAP 1.0 screens are tiny — keep pages short there regardless of the user's
+  // configured preference; xhtml/html5 devices can handle the configured size.
+  const tier = res.locals?.tier || detectTier(req);
+  const limit = tier === 'wml' ? 3 : (userSettings.paginationLimit || 10);
   const search = query.q || "";
   const refreshNonce = Date.now();
   const showGroups = query.groups !== "0"; // Default show groups
@@ -17886,7 +17419,7 @@ app.get("/wml/chats.wml", async (req, res) => {
         // Safe text processing
         const messagePreview =
           lastMessageText.length > 40
-            ? lastMessageText.substring(0, 37) + "..."
+            ? safeSlice(lastMessageText, 37) + "..."
             : lastMessageText;
         const fromIndicator = fromMe ? "[out] " : "[in] ";
 
@@ -17894,7 +17427,7 @@ app.get("/wml/chats.wml", async (req, res) => {
         const timeStr = c.lastMessage?.timeStr || "Unknown time";
 
         const typeTag = c.isGroup ? "[G]" : "[D]";
-        const shortName = c.name.length > 14 ? c.name.substring(0, 13) + "." : c.name;
+        const shortName = c.name.length > 14 ? safeSlice(c.name, 13) + "." : c.name;
         return `<p><b>${start + idx + 1}. ${escWml(shortName)}</b>${typeTag}${unreadBadge}<br/>
       <small>${escWml(fromIndicator + messagePreview)}</small><br/>
       <small>${escWml(timeStr)} (${c.messageCount})</small><br/>
@@ -18116,9 +17649,9 @@ app.get("/wml/chats.search.wml", async (req, res) => {
 
     <p><b>Quick Searches:</b></p>
     <p>
-      <a href="/wml/chats.wml?q=unread" accesskey="1">[1] Recent Activity</a><br/>
-      <a href="/wml/chats.wml?groups=1&amp;direct=0" accesskey="2">[2] Groups Only</a><br/>
-      <a href="/wml/chats.wml?groups=0&amp;direct=1" accesskey="3">[3] Direct Only</a><br/>
+      <a href="/wml/chats.wml?q=unread" accesskey="5">[5] Recent Activity</a><br/>
+      <a href="/wml/chats.wml?groups=1&amp;direct=0" accesskey="6">[6] Groups Only</a><br/>
+      <a href="/wml/chats.wml?groups=0&amp;direct=1" accesskey="7">[7] Direct Only</a><br/>
     </p>
     
     ${navigationBar()}
@@ -18132,7 +17665,8 @@ app.get("/wml/chats.results.wml", async (req, res) => {
   const q = String(req.query.q || "").trim();
   const chatType = req.query.type || "all";
   const sortBy = req.query.sort || "recent";
-  const limit = 3; // Fisso a 3 elementi per pagina
+  const tier = res.locals?.tier || detectTier(req);
+  const limit = tier === 'wml' ? 3 : (userSettings.paginationLimit || 10);
 
   if (!q || q.length < 1) {
     sendWml(
@@ -18316,9 +17850,8 @@ app.use((err, req, res, next) => {
       : `${t('common.error')}: ${err.message}`;
     const jid = req.body?.to || req.body?.jid || null;
     res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 500);
-    res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    return res.send(operaResultPage(t('common.error'), message, jid));
+    return operaResultPage(res, t('common.error'), message, jid);
   }
   next(err);
 });

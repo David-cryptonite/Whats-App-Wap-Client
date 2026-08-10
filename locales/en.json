@@ -722,6 +722,7 @@
 
   "opera": {
     "page_title": "Send Media",
+    "wap1_unsupported": "Sending photos, videos, and files isn't supported on this device's browser. WML 1.0 phones have no file-picker control. Use a newer phone or a desktop/modern browser to send media; text messages still work fine here.",
     "to": "To:",
     "image": "Image",
     "audio": "Audio",
