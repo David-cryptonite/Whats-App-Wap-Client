@@ -1530,6 +1530,9 @@ async function sendWAPPushViaKannel({ phoneNumber, text, href, siId, action, cre
   const siXml = buildWapSiXml({ href, text, siId: `${siId}@${siDomain}`, action, created, expires });
   const papXml = buildWapPapXml({ pushId, phoneNumber, ppgDomain });
 
+  console.log(`[WAP Push Kannel] pap.xml:\n${papXml}`);
+  console.log(`[WAP Push Kannel] si.xml:\n${siXml}`);
+
   const boundary = `KannelPushBoundary${crypto.randomBytes(8).toString('hex')}`;
   const body = [
     `--${boundary}\r\n`,
@@ -1552,7 +1555,9 @@ async function sendWAPPushViaKannel({ phoneNumber, text, href, siId, action, cre
       timeout: 10000
     });
 
-    if (response.status === 200) {
+    // Kannel's wappush service replies 202 Accepted on success (PAP "accepted for
+    // processing"), not 200 — a plain 200 check would flag every real success as a failure.
+    if (response.status === 200 || response.status === 202) {
       logger.info(`✓ WAP Push (Kannel) sent to ${phoneNumber} [ID: ${siId}, action: ${action}]`);
       return { success: true };
     }
