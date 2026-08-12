@@ -1,3 +1,12 @@
+// Load .env before anything else reads process.env — README documents .env as
+// the recommended configuration method, but nothing was actually loading it
+// (no dotenv import existed anywhere), so every setting in .env was silently
+// ignored and the app ran on hardcoded JS defaults / whatever was already in
+// the shell environment instead. Must be the very first import: ES module
+// imports all evaluate before the rest of this file's top-level `const X =
+// process.env.X` assignments run, so this guarantees .env is loaded in time.
+import 'dotenv/config';
+
 // Multi-threading and clustering for high performance
 import cluster from 'cluster';
 import os from 'os';
@@ -2592,7 +2601,10 @@ let userSettings = {
   wapPushHistoryLimit: 30,
   ...(persistentData.settings || {}),
   // Env var always wins over persisted value
-  ...(process.env.WAP_PUSH_PHONE ? { wapPushPhone: process.env.WAP_PUSH_PHONE } : {})
+  ...(process.env.WAP_PUSH_PHONE ? { wapPushPhone: process.env.WAP_PUSH_PHONE } : {}),
+  ...(process.env.WAP_PUSH_ENABLED !== undefined
+    ? { wapPushEnabled: !['0', 'false', 'no', 'off'].includes(process.env.WAP_PUSH_ENABLED.toLowerCase()) }
+    : {})
 };
 
 // ============ I18N / TRANSLATIONS ============

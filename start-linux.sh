@@ -74,15 +74,15 @@ export HTTPS_CERTS_DIR="${HTTPS_CERTS_DIR:-$(pwd)/certs}"
 export AUTH_ENABLED="${AUTH_ENABLED:-false}"
 
 # ---------- Markup Mode ----------
-# MARKUP_MODE: controls the output format for all WML pages.
-#   "wml"   = WML 1.0 for WAP phones (default)
+# MARKUP_MODE: when set, forces every device to the same output format:
+#   "wml"   = WML 1.0 for WAP 1.x phones
 #   "xhtml" = XHTML Mobile Profile 1.0 (WAP-277) with WCSS for WAP 2.0 browsers
-#   "html5" = HTML5 with WhatsApp-themed CSS (for modern browsers)
-export MARKUP_MODE="${MARKUP_MODE:-xhtml}"
-# UPLOAD_MARKUP_MODE: controls the output format for the upload page (/opera/send).
-#   "xhtml" = XHTML-MP minimal upload form (no JS, no chunked upload)
-#   "html5" = full HTML5 upload page with chunked upload, progress bar, CSS (default)
-export UPLOAD_MARKUP_MODE="${UPLOAD_MARKUP_MODE:-xhtml}"
+#   "html5" = HTML5 with WhatsApp-themed CSS for modern browsers
+# Leave UNSET (the default here) to auto-detect per request from the device's
+# User-Agent instead — WAP 1.0/2.0 phones and modern/Opera Mini browsers each
+# get the right markup automatically, from the same running server. Only set
+# this if you want to force a single tier for every visitor regardless of device.
+export MARKUP_MODE="${MARKUP_MODE:-}"
 
 # ---------- WhatsApp Pairing ----------
 # WA_PHONE_NUMBER: if set, uses pairing code instead of QR code.
@@ -110,8 +110,7 @@ echo "[env] WAP_PUSH_AUTH=$WAP_PUSH_AUTH"
 echo "[env] WAP_PUSH_ENABLED=$WAP_PUSH_ENABLED"
 echo "[env] WAP_PUSH_PHONE=$WAP_PUSH_PHONE"
 echo "[env] AUTH_ENABLED=$AUTH_ENABLED"
-echo "[env] MARKUP_MODE=$MARKUP_MODE"
-echo "[env] UPLOAD_MARKUP_MODE=$UPLOAD_MARKUP_MODE"
+echo "[env] MARKUP_MODE=${MARKUP_MODE:-<auto-detect per device>}"
 echo "[env] WA_PHONE_NUMBER=$WA_PHONE_NUMBER"
 
 npm start

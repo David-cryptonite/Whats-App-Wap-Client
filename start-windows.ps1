@@ -73,21 +73,21 @@ if ([string]::IsNullOrWhiteSpace($env:HTTPS_CERTS_DIR)) { $env:HTTPS_CERTS_DIR =
 if ([string]::IsNullOrWhiteSpace($env:AUTH_ENABLED)) { $env:AUTH_ENABLED = "false" }
 
 # ---------- Markup Mode ----------
-# MARKUP_MODE: controls the output format for all WML pages.
-#   "wml"   = WML 1.0 for WAP phones (default)
+# MARKUP_MODE: when set, forces every device to the same output format:
+#   "wml"   = WML 1.0 for WAP 1.x phones
 #   "xhtml" = XHTML Mobile Profile 1.0 (WAP-277) with WCSS for WAP 2.0 browsers
-#   "html5" = HTML5 with WhatsApp-themed CSS (for modern browsers)
-if ([string]::IsNullOrWhiteSpace($env:MARKUP_MODE)) { $env:MARKUP_MODE = "xhtml" }
-# UPLOAD_MARKUP_MODE: controls the output format for the upload page (/opera/send).
-#   "xhtml" = XHTML-MP minimal upload form (no JS, no chunked upload)
-#   "html5" = full HTML5 upload page with chunked upload, progress bar, CSS (default)
-if ([string]::IsNullOrWhiteSpace($env:UPLOAD_MARKUP_MODE)) { $env:UPLOAD_MARKUP_MODE = "xhtml" }
+#   "html5" = HTML5 with WhatsApp-themed CSS for modern browsers
+# Leave UNSET (the default here) to auto-detect per request from the device's
+# User-Agent instead — WAP 1.0/2.0 phones and modern/Opera Mini browsers each
+# get the right markup automatically, from the same running server. Only set
+# this if you want to force a single tier for every visitor regardless of device.
 
 # ---------- WhatsApp Pairing ----------
 # WA_PHONE_NUMBER: if set, uses pairing code instead of QR code.
 # Format: digits only with country code (e.g. 393401234567 for Italy +39).
 # If empty or unset, the server shows a QR code for scanning.
 # Example: $env:WA_PHONE_NUMBER = "393401234567"
+if ([string]::IsNullOrWhiteSpace($env:WA_PHONE_NUMBER)) { $env:WA_PHONE_NUMBER = "" }
 
 # ---------- Print configuration ----------
 Write-Host "[env] NODE_ENV=$env:NODE_ENV"
@@ -108,8 +108,7 @@ Write-Host "[env] WAP_PUSH_AUTH=$env:WAP_PUSH_AUTH"
 Write-Host "[env] WAP_PUSH_ENABLED=$env:WAP_PUSH_ENABLED"
 Write-Host "[env] WAP_PUSH_PHONE=$env:WAP_PUSH_PHONE"
 Write-Host "[env] AUTH_ENABLED=$env:AUTH_ENABLED"
-Write-Host "[env] MARKUP_MODE=$env:MARKUP_MODE"
-Write-Host "[env] UPLOAD_MARKUP_MODE=$env:UPLOAD_MARKUP_MODE"
+Write-Host "[env] MARKUP_MODE=$(if ($env:MARKUP_MODE) { $env:MARKUP_MODE } else { '<auto-detect per device>' })"
 Write-Host "[env] WA_PHONE_NUMBER=$env:WA_PHONE_NUMBER"
 
 npm start

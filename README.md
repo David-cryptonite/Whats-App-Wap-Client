@@ -111,8 +111,7 @@ All configuration is done via environment variables. You can set them in a `.env
 | `HTTPS_PORT` | `443` | HTTPS port |
 | `HTTPS_CERTS_DIR` | `./certs` | Directory for TLS certificates |
 | `WA_PHONE_NUMBER` | *(empty)* | WhatsApp phone number for pairing code (digits only, with country code, e.g. `391234567890`). If empty, uses QR code. |
-| `MARKUP_MODE` | `wml` | Output format for pages: `wml`, `xhtml`, `html5` |
-| `UPLOAD_MARKUP_MODE` | `html5` | Output format for upload page: `xhtml` or `html5` |
+| `MARKUP_MODE` | *(unset = auto-detect)* | Force one output format for every device: `wml`, `xhtml`, or `html5`. Leave unset to auto-detect per request from the User-Agent (WAP 1.0 phones get WML, WAP 2.0/XHTML-MP phones get XHTML, modern/Opera Mini browsers get HTML5 — all from the same running server). |
 | `WAP_PUSH_ENABLED` | `true` | Initial default for WAP Push master switch |
 | `WAP_PUSH_BASE_URL` | *(empty)* | NowSMS gateway URL for sending WAP Push SI |
 | `WAP_PUSH_AUTH` | *(empty)* | Authorization header for NowSMS (`Basic base64(user:pass)`) |
