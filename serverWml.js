@@ -636,7 +636,10 @@ async function initWhisperModel() {
     console.log("Initializing Whisper model (base - better accuracy)...");
 
     // Usa import dinamico per caricare il modulo ESM
-    const { pipeline } = await import("@xenova/transformers");
+    // @huggingface/transformers is the maintained successor to @xenova/transformers
+    // (same author/API, continued under the Hugging Face org) — migrated to it to
+    // pick up patched onnxruntime-web/protobufjs/sharp versions.
+    const { pipeline } = await import("@huggingface/transformers");
 
     // Using whisper-base for better transcription quality
     // whisper-tiny: 39MB, lower accuracy
@@ -646,7 +649,7 @@ async function initWhisperModel() {
       "Xenova/whisper-base",
       {
         // ⚡ 74MB - better accuracy than tiny (39MB)
-        quantized: true, // 🔥 Usa 8-bit per ridurre RAM
+        dtype: "q8", // 🔥 8-bit quantization to reduce RAM (replaces old `quantized: true`)
         local_files_only: false,
       }
     );
