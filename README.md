@@ -113,10 +113,16 @@ All configuration is done via environment variables. You can set them in a `.env
 | `WA_PHONE_NUMBER` | *(empty)* | WhatsApp phone number for pairing code (digits only, with country code, e.g. `391234567890`). If empty, uses QR code. |
 | `MARKUP_MODE` | *(unset = auto-detect)* | Force one output format for every device: `wml`, `xhtml`, or `html5`. Leave unset to auto-detect per request from the User-Agent (WAP 1.0 phones get WML, WAP 2.0/XHTML-MP phones get XHTML, modern/Opera Mini browsers get HTML5 — all from the same running server). |
 | `WAP_PUSH_ENABLED` | `true` | Initial default for WAP Push master switch |
-| `WAP_PUSH_BASE_URL` | *(empty)* | NowSMS gateway URL for sending WAP Push SI |
-| `WAP_PUSH_AUTH` | *(empty)* | Authorization header for NowSMS (`Basic base64(user:pass)`) |
+| `WAP_PUSH_METHOD` | `nowsms` | Delivery method: `nowsms` (HTTP GET to a NowSMS-compatible gateway) or `kannel` (multipart PAP push straight to Kannel) |
 | `WAP_PUSH_PHONE` | *(empty)* | Initial phone number for WAP Push notifications |
+| `WAP_PUSH_MAX_SMS_PER_MONTH` | *(empty = unlimited)* | Caps WAP Push sends (notifications + auto-deletes) per calendar month; further sends are skipped once reached, counter resets next month |
 | `WAP_SERVER_BASE` | *(empty)* | Public URL of this server reachable from the phone's mobile network. **Must not be 127.0.0.1** |
+| `WAP_PUSH_BASE_URL` | *(empty)* | NowSMS gateway URL for sending WAP Push SI (used when `WAP_PUSH_METHOD=nowsms`) |
+| `WAP_PUSH_AUTH` | *(empty)* | Authorization header for NowSMS (`Basic base64(user:pass)`) |
+| `WAP_PUSH_KANNEL_URL` | `http://localhost:8080/wappush` | Kannel wappush service URL (used when `WAP_PUSH_METHOD=kannel`) |
+| `WAP_PUSH_KANNEL_AUTH` | *(empty)* | Optional Basic Auth header for the Kannel wappush service |
+| `WAP_PUSH_KANNEL_PPG` | `ppg.carrier.com` | PPG domain used to build the `WAPPUSH=` PAP address |
+| `WAP_PUSH_KANNEL_SI_DOMAIN` | `tuodominio.com` | Domain used to build the SI `si-id` value (`<id>@<domain>`) |
 
 ### Startup Scripts
 
@@ -223,23 +229,42 @@ Point your phone's WAP settings to the Kannel gateway IP, and configure Kannel t
 
 ### WAP Push Notifications (Optional)
 
-When a new WhatsApp message arrives, the server can send a WAP Push SI (Service Indication) notification to the configured phone number via NowSMS.
+When a new WhatsApp message arrives, the server can send a WAP Push SI (Service Indication) notification to the configured phone number. Two delivery methods are supported, selected via `WAP_PUSH_METHOD`:
 
-**Setup:**
+- **`nowsms`** (default) — HTTP GET to a [NowSMS](https://www.nowsms.com/) (or compatible) gateway.
+- **`kannel`** — POSTs a `multipart/related` PAP request (a `pap.xml` push envelope plus a `si.xml` Service Indication) directly to a Kannel `wappush` service, with no NowSMS in the middle. Same mechanism is used for the auto-delete follow-up (`action="delete"` referencing the original `si-id`).
+
+**Setup (NowSMS):**
 1. Install and configure a [NowSMS](https://www.nowsms.com/) gateway
 2. Set the following environment variables in your `.env`:
    ```env
    WAP_PUSH_ENABLED=true
+   WAP_PUSH_METHOD=nowsms
    WAP_PUSH_BASE_URL=http://your-nowsms-server:port/Send%20WAP%20Push%20Message.htm
    WAP_PUSH_AUTH=Basic <base64-encoded-user:pass>
    WAP_PUSH_PHONE=your-phone-number
    WAP_SERVER_BASE=http://your-public-ip:3500
    ```
+
+**Setup (Kannel):**
+1. Enable Kannel's `wappush` module (`sendsms-url`/`wapbox` config with a `wap-push-service` group) so it accepts PAP pushes on an HTTP port
+2. Set the following environment variables in your `.env`:
+   ```env
+   WAP_PUSH_ENABLED=true
+   WAP_PUSH_METHOD=kannel
+   WAP_PUSH_KANNEL_URL=http://localhost:8080/wappush
+   WAP_PUSH_KANNEL_AUTH=Basic <base64-encoded-user:pass>   # if your Kannel push service requires auth
+   WAP_PUSH_KANNEL_PPG=ppg.carrier.com
+   WAP_PUSH_KANNEL_SI_DOMAIN=your-domain.com
+   WAP_PUSH_PHONE=your-phone-number
+   WAP_SERVER_BASE=http://your-public-ip:3500
+   ```
+
 3. You can also configure all options at runtime from the phone in **Settings > WAP Push**
 
 The notification includes the sender name, message preview, and a direct link to the chat.
 
-Environment variables (`WAP_PUSH_ENABLED`, `WAP_PUSH_PHONE`) set the initial defaults; runtime settings override them and are persisted across restarts.
+Environment variables (`WAP_PUSH_ENABLED`, `WAP_PUSH_METHOD`, `WAP_PUSH_PHONE`) set the initial defaults; runtime settings override them and are persisted across restarts.
 
 ## Project Structure
 

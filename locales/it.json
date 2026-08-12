@@ -173,7 +173,11 @@
     "history_limit": "Max notifiche:",
     "history_title": "Limite Cronologia",
     "history_current": "Limite attuale:",
-    "history_select": "Seleziona limite:"
+    "history_select": "Seleziona limite:",
+    "sms_usage": "SMS Mensili:",
+    "sms_usage_limited": "usati questo mese:",
+    "sms_usage_unlimited": "usati questo mese (nessun limite):",
+    "sms_usage_blocked": "⚠ Limite mensile raggiunto, invii sospesi"
   },
 
   "settings_tts": {

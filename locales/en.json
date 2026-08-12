@@ -173,7 +173,11 @@
     "history_limit": "Max notifications:",
     "history_title": "History Limit",
     "history_current": "Current limit:",
-    "history_select": "Select limit:"
+    "history_select": "Select limit:",
+    "sms_usage": "Monthly SMS:",
+    "sms_usage_limited": "used this month:",
+    "sms_usage_unlimited": "used this month (no limit):",
+    "sms_usage_blocked": "⚠ Monthly limit reached, sends paused"
   },
 
   "settings_tts": {

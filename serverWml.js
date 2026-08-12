@@ -1433,8 +1433,130 @@ async function textToSpeechLocal(text, language = 'en') {
 }
 
 // ============ WAP PUSH NOTIFICATION HELPER ============
+
+// Enforces WAP_PUSH_MAX_SMS_PER_MONTH (0/unset = unlimited). Each call to
+// sendWAPPushNotification or sendWAPDelete consumes one unit — both are a real
+// gateway send (NowSMS or Kannel), which is what actually costs an SMS. The counter
+// resets automatically on the first send of a new calendar month.
+function checkAndConsumeWapPushSmsQuota() {
+  const maxPerMonth = parseInt(process.env.WAP_PUSH_MAX_SMS_PER_MONTH || '0', 10);
+  if (!maxPerMonth || maxPerMonth <= 0) return true;
+
+  const now = new Date();
+  const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+
+  if (userSettings.wapPushSmsMonthKey !== monthKey) {
+    userSettings.wapPushSmsMonthKey = monthKey;
+    userSettings.wapPushSmsCount = 0;
+  }
+
+  if (userSettings.wapPushSmsCount >= maxPerMonth) {
+    logger.warn(`⚠ WAP Push monthly SMS limit reached (${userSettings.wapPushSmsCount}/${maxPerMonth}) — skipping send`);
+    return false;
+  }
+
+  userSettings.wapPushSmsCount++;
+  saveSettings();
+  return true;
+}
+
+// Read-only view of the current month's usage, for display in Settings > WAP Push.
+// Does not mutate userSettings — the counter itself only resets on an actual send.
+function getWapPushSmsUsage() {
+  const maxPerMonth = parseInt(process.env.WAP_PUSH_MAX_SMS_PER_MONTH || '0', 10);
+  const now = new Date();
+  const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const count = userSettings.wapPushSmsMonthKey === monthKey ? (userSettings.wapPushSmsCount || 0) : 0;
+  const max = maxPerMonth > 0 ? maxPerMonth : null;
+  return { count, max, blocked: max !== null && count >= max };
+}
+
+// Funzione per formato locale ISO (usata sia dal metodo NowSMS che Kannel)
+function toLocalISO(date) {
+  const pad = (n) => n.toString().padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}Z`;
+}
+
+// ---- Kannel (multipart PAP) delivery ----
+// Builds a WAP Push SI (Service Indication) XML document per the WAP Forum SI 1.0 DTD.
+function buildWapSiXml({ href, text, siId, action = 'signal-high', created, expires }) {
+  const attrs = [`href="${esc(href)}"`];
+  if (siId) attrs.push(`si-id="${esc(siId)}"`);
+  attrs.push(`action="${esc(action)}"`);
+  if (created) attrs.push(`created="${esc(created)}"`);
+  if (expires) attrs.push(`si-expires="${esc(expires)}"`);
+  return `<?xml version="1.0"?>
+<!DOCTYPE si PUBLIC "-//WAPFORUM//DTD SI 1.0//EN" "http://www.wapforum.org/DTD/si.dtd">
+<si>
+  <indication ${attrs.join(' ')}>
+    ${esc(text)}
+  </indication>
+</si>`;
+}
+
+// Builds a PAP (Push Access Protocol) XML envelope addressing a single MSISDN via Kannel's PPG.
+function buildWapPapXml({ pushId, phoneNumber, ppgDomain }) {
+  const msisdn = String(phoneNumber).replace(/^\+/, '');
+  return `<?xml version="1.0"?>
+<!DOCTYPE pap PUBLIC "-//WAPFORUM//DTD PAP//EN" "http://www.wapforum.org/DTD/pap_1.0.dtd">
+<pap>
+  <push-message push-id="${esc(pushId)}">
+    <address address-value="WAPPUSH=+${esc(msisdn)}/TYPE=PLMN@${esc(ppgDomain)}"/>
+  </push-message>
+</pap>`;
+}
+
+// Sends a push via a Kannel wappush service using a multipart/related PAP+SI request,
+// as an alternative to the NowSMS HTTP GET interface.
+async function sendWAPPushViaKannel({ phoneNumber, text, href, siId, action, created, expires }) {
+  const KANNEL_URL = process.env.WAP_PUSH_KANNEL_URL || '';
+  if (!KANNEL_URL) { logger.warn('WAP_PUSH_KANNEL_URL not configured — skipping Kannel WAP Push'); return { success: false }; }
+  const ppgDomain = process.env.WAP_PUSH_KANNEL_PPG || 'ppg.carrier.com';
+  const siDomain = process.env.WAP_PUSH_KANNEL_SI_DOMAIN || 'localhost';
+  const AUTH = process.env.WAP_PUSH_KANNEL_AUTH || '';
+
+  const pushId = `${siId}-${Date.now().toString(36)}`;
+  const siXml = buildWapSiXml({ href, text, siId: `${siId}@${siDomain}`, action, created, expires });
+  const papXml = buildWapPapXml({ pushId, phoneNumber, ppgDomain });
+
+  const boundary = `KannelPushBoundary${crypto.randomBytes(8).toString('hex')}`;
+  const body = [
+    `--${boundary}\r\n`,
+    `Content-Type: application/xml\r\n`,
+    `Content-ID: <control>\r\n`,
+    `\r\n`,
+    `${papXml}\r\n`,
+    `--${boundary}\r\n`,
+    `Content-Type: text/vnd.wap.si\r\n`,
+    `\r\n`,
+    `${siXml}\r\n`,
+    `--${boundary}--\r\n`
+  ].join('');
+
+  try {
+    const response = await axios.post(KANNEL_URL, body, {
+      headers: {
+        'Content-Type': `multipart/related; boundary=${boundary}; type="application/xml"; start="<control>"`,
+        ...(AUTH ? { 'Authorization': AUTH } : {})
+      },
+      timeout: 10000
+    });
+
+    if (response.status === 200) {
+      logger.info(`✓ WAP Push (Kannel) sent to ${phoneNumber} [ID: ${siId}, action: ${action}]`);
+      return { success: true };
+    }
+    logger.warn(`⚠ WAP Push (Kannel) responded with status ${response.status}`);
+    return { success: false };
+  } catch (error) {
+    logger.error(`❌ WAP Push (Kannel) failed: ${error.message}`);
+    return { success: false, error: error.message };
+  }
+}
+
 /**
- * Sends a WAP Push notification to the specified phone number
+ * Sends a WAP Push notification to the specified phone number.
+ * Delivery method is selected via userSettings.wapPushMethod ('nowsms' or 'kannel').
  * @param {string} phoneNumber - Recipient phone number (e.g., "391234567890")
  * @param {string} text - Notification text content (max 100 chars recommended)
  * @param {string} wmlPath - Relative WML path (e.g., "/wml/chat.wml?jid=...")
@@ -1443,12 +1565,12 @@ async function textToSpeechLocal(text, language = 'en') {
  */
 async function sendWAPPushNotification(phoneNumber, text, wmlPath, siAction = 'signal-high', expireMs = 120000) {
   try {
-    const WAP_PUSH_BASE_URL = process.env.WAP_PUSH_BASE_URL || '';
-    if (!WAP_PUSH_BASE_URL) { logger.warn('WAP_PUSH_BASE_URL not configured — skipping WAP Push'); return false; }
+    if (!checkAndConsumeWapPushSmsQuota()) return { success: false, error: 'monthly SMS limit reached' };
+
     // WAP_SERVER_BASE must be the public URL reachable by the phone (not 127.0.0.1) —
-    // unlike WAP_PUSH_BASE_URL above, a missing value used to fall back silently to
-    // a loopback address the phone can never reach, so every push "succeeded" while
-    // actually linking nowhere. Warn loudly instead of failing silently.
+    // a missing value used to fall back silently to a loopback address the phone can
+    // never reach, so every push "succeeded" while actually linking nowhere. Warn loudly
+    // instead of failing silently.
     if (!process.env.WAP_SERVER_BASE) {
       logger.warn('WAP_SERVER_BASE not configured — WAP Push links will use ' +
         (HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1') +
@@ -1456,7 +1578,6 @@ async function sendWAPPushNotification(phoneNumber, text, wmlPath, siAction = 's
     }
     const WAP_SERVER_BASE = process.env.WAP_SERVER_BASE
       || `${HTTPS_ENABLED ? 'https' : 'http'}://${HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1'}:${HTTPS_ENABLED ? HTTPS_PORT : port}`;
-    const AUTH = process.env.WAP_PUSH_AUTH || '';
 
     const fullWMLURL = `${WAP_SERVER_BASE}${wmlPath}`;
     const truncatedText = text.length > 100 ? safeSlice(text, 97) + '...' : text;
@@ -1464,14 +1585,25 @@ async function sendWAPPushNotification(phoneNumber, text, wmlPath, siAction = 's
     // Genera WAPSIID univoco
     const wapsiid = generateWAPSIID();
 
-    // Funzione per formato locale ISO
-    const toLocalISO = (date) => {
-      const pad = (n) => n.toString().padStart(2, '0');
-      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}Z`;
-    };
-
     const now = new Date();
     const created = toLocalISO(now);
+    const expires = expireMs > 0 ? toLocalISO(new Date(now.getTime() + expireMs)) : null;
+
+    if (userSettings.wapPushMethod === 'kannel') {
+      const result = await sendWAPPushViaKannel({
+        phoneNumber, text: truncatedText, href: fullWMLURL, siId: wapsiid, action: siAction, created, expires
+      });
+      if (result.success) {
+        logger.info(`✓ WAP Push sent to ${phoneNumber}: "${truncatedText}" [ID: ${wapsiid}, Expire: ${expireMs > 0 ? expireMs + 'ms' : 'none'}]`);
+        return { success: true, wapsiid };
+      }
+      return result;
+    }
+
+    // ---- NowSMS (default) ----
+    const WAP_PUSH_BASE_URL = process.env.WAP_PUSH_BASE_URL || '';
+    if (!WAP_PUSH_BASE_URL) { logger.warn('WAP_PUSH_BASE_URL not configured — skipping WAP Push'); return false; }
+    const AUTH = process.env.WAP_PUSH_AUTH || '';
 
     // Build params — expiration is optional
     const params = new URLSearchParams({
@@ -1484,9 +1616,8 @@ async function sendWAPPushNotification(phoneNumber, text, wmlPath, siAction = 's
     });
 
     // Only add expiration if enabled (expireMs > 0)
-    if (expireMs > 0) {
-      const expireDate = new Date(now.getTime() + expireMs);
-      params.set('WAPSIEXPIRES', toLocalISO(expireDate));
+    if (expires) {
+      params.set('WAPSIEXPIRES', expires);
     }
 
     // Invia WAP Push
@@ -1536,27 +1667,43 @@ function scheduleWAPDelete(phoneNumber, wapsiid, expireMinutes) {
 }
 
 /**
- * Invia la richiesta di DELETE per un WAPSIID specifico
+ * Invia la richiesta di DELETE per un WAPSIID specifico.
+ * Delivery method is selected via userSettings.wapPushMethod ('nowsms' or 'kannel').
  */
 async function sendWAPDelete(phoneNumber, wapsiid) {
   try {
-    const WAP_PUSH_BASE_URL = process.env.WAP_PUSH_BASE_URL || '';
-    if (!WAP_PUSH_BASE_URL) { logger.warn('WAP_PUSH_BASE_URL not configured — skipping WAP Push delete'); return false; }
-    const AUTH = process.env.WAP_PUSH_AUTH || '';
+    if (!checkAndConsumeWapPushSmsQuota()) return false;
+
     if (!process.env.WAP_SERVER_BASE) {
       logger.warn('WAP_SERVER_BASE not configured — WAP Push delete URL will use ' +
         (HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1') +
         ', which the recipient phone likely cannot reach. Set WAP_SERVER_BASE to your public URL.');
     }
+    const WAP_SERVER_BASE = process.env.WAP_SERVER_BASE
+      || `${HTTPS_ENABLED ? 'https' : 'http'}://${HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1'}:${HTTPS_ENABLED ? HTTPS_PORT : port}`;
+
+    if (userSettings.wapPushMethod === 'kannel') {
+      const result = await sendWAPPushViaKannel({
+        phoneNumber, text: 'Delete Notification', href: WAP_SERVER_BASE, siId: wapsiid, action: 'delete'
+      });
+      if (result.success) {
+        logger.info(`✓ WAP DELETE sent successfully for ID: ${wapsiid}`);
+        return true;
+      }
+      return false;
+    }
+
+    // ---- NowSMS (default) ----
+    const WAP_PUSH_BASE_URL = process.env.WAP_PUSH_BASE_URL || '';
+    if (!WAP_PUSH_BASE_URL) { logger.warn('WAP_PUSH_BASE_URL not configured — skipping WAP Push delete'); return false; }
+    const AUTH = process.env.WAP_PUSH_AUTH || '';
 
     const params = new URLSearchParams({
-
       PhoneNumber: phoneNumber,
-      WAPURL: process.env.WAP_SERVER_BASE || `${HTTPS_ENABLED ? 'https' : 'http'}://${HTTPS_ENABLED ? HTTPS_DOMAIN : '127.0.0.1'}:${HTTPS_ENABLED ? HTTPS_PORT : port}`,
+      WAPURL: WAP_SERVER_BASE,
       Text: 'Delete Notification',   // Testo vuoto per delete
       WAPSIACTION: 'delete',
       WAPSIID: wapsiid
-    
     });
 
     const response = await axios.get(`${WAP_PUSH_BASE_URL}?${params.toString()}`, {
@@ -2602,12 +2749,16 @@ let userSettings = {
   wapPushDeleteEnabled: true,
   wapPushHistoryEnabled: true,
   wapPushHistoryLimit: 30,
+  wapPushMethod: 'nowsms',       // 'nowsms' (HTTP GET) or 'kannel' (multipart PAP push)
+  wapPushSmsCount: 0,            // sends (push + delete) used in the current calendar month
+  wapPushSmsMonthKey: '',        // 'YYYY-MM' the counter above applies to; reset when it changes
   ...(persistentData.settings || {}),
   // Env var always wins over persisted value
   ...(process.env.WAP_PUSH_PHONE ? { wapPushPhone: process.env.WAP_PUSH_PHONE } : {}),
   ...(process.env.WAP_PUSH_ENABLED !== undefined
     ? { wapPushEnabled: !['0', 'false', 'no', 'off'].includes(process.env.WAP_PUSH_ENABLED.toLowerCase()) }
-    : {})
+    : {}),
+  ...(process.env.WAP_PUSH_METHOD ? { wapPushMethod: process.env.WAP_PUSH_METHOD.toLowerCase() === 'kannel' ? 'kannel' : 'nowsms' } : {})
 };
 
 // ============ I18N / TRANSLATIONS ============
@@ -4251,6 +4402,7 @@ app.get("/wml/settings-wappush.wml", (req, res) => {
   const histOn = !!userSettings.wapPushHistoryEnabled;
   const expSec = Math.round((userSettings.wapPushExpireMs || 120000) / 1000);
   const histLim = userSettings.wapPushHistoryLimit || 30;
+  const smsUsage = getWapPushSmsUsage();
 
   const body = `
     <p><b>${t('settings_wappush.title')}</b></p>
@@ -4309,6 +4461,12 @@ app.get("/wml/settings-wappush.wml", (req, res) => {
     </anchor></p>
     ${histOn ? `<p>${t('settings_wappush.history_limit')} ${histLim}<br/>
     <a href="/wml/settings-wappush-history.wml">${t('settings.change')}</a></p>` : ''}
+
+    <p><b>${t('settings_wappush.sms_usage')}</b></p>
+    <p>${smsUsage.max !== null
+      ? `${t('settings_wappush.sms_usage_limited')} ${smsUsage.count}/${smsUsage.max}`
+      : `${t('settings_wappush.sms_usage_unlimited')} ${smsUsage.count}`}
+    ${smsUsage.blocked ? `<br/>${t('settings_wappush.sms_usage_blocked')}` : ''}</p>
 
     <p><a href="/wml/settings.wml" accesskey="0">${t('common.back')}</a></p>
 
