@@ -33,27 +33,47 @@ export AUTH_DB_PATH="${AUTH_DB_PATH:-$(pwd)/auth.db}"
 # SESSION_DB_PATH: SQLite database for Express session storage
 export SESSION_DB_PATH="${SESSION_DB_PATH:-$(pwd)/sessions.db}"
 
-# ---------- WAP Push / NowSMS Gateway ----------
+# ---------- WAP Push (NowSMS or Kannel) ----------
 # WAP Push sends real-time notifications to the phone when new WhatsApp messages arrive.
-# Requires a NowSMS gateway (or compatible WAP Push SI provider).
+# Two delivery methods are supported (WAP_PUSH_METHOD): "nowsms" (HTTP GET to a NowSMS
+# or compatible gateway) or "kannel" (multipart PAP push straight to a Kannel wappush service).
 #
-# NOTE: WAP_PUSH_ENABLED and WAP_PUSH_PHONE set the initial defaults only.
-# At runtime, all WAP Push options (enable/disable, expiration, auto-delete,
+# NOTE: WAP_PUSH_ENABLED, WAP_PUSH_METHOD and WAP_PUSH_PHONE set the initial defaults only.
+# At runtime, most WAP Push options (enable/disable, expiration, auto-delete,
 # history limit) are configurable from the Settings > WAP Push page.
 #
 # WAP_PUSH_ENABLED: initial default for WAP Push master switch (true/false/1/0/yes/no)
 export WAP_PUSH_ENABLED="${WAP_PUSH_ENABLED:-true}"
-# WAP_PUSH_BASE_URL: NowSMS HTTP endpoint for sending WAP Push SI messages
-export WAP_PUSH_BASE_URL="${WAP_PUSH_BASE_URL:-}"
-# WAP_PUSH_AUTH: HTTP Authorization header for NowSMS (Basic base64(user:pass))
-export WAP_PUSH_AUTH="${WAP_PUSH_AUTH:-}"
+# WAP_PUSH_METHOD: "nowsms" (default) or "kannel"
+export WAP_PUSH_METHOD="${WAP_PUSH_METHOD:-nowsms}"
 # WAP_PUSH_PHONE: initial phone number for WAP Push notifications (empty = disabled)
 # Can be changed at runtime from Settings > WAP Push
 export WAP_PUSH_PHONE="${WAP_PUSH_PHONE:-}"
+# WAP_PUSH_MAX_SMS_PER_MONTH: caps WAP Push sends (notifications + auto-deletes) per
+# calendar month, across either delivery method. Empty/0 = unlimited.
+export WAP_PUSH_MAX_SMS_PER_MONTH="${WAP_PUSH_MAX_SMS_PER_MONTH:-}"
 # WAP_SERVER_BASE: public URL of this server reachable from the phone's mobile network.
 # Used in WAP Push SI links so the phone can open the chat directly.
 # IMPORTANT: must NOT be 127.0.0.1 — the phone needs to reach this from the carrier network.
 export WAP_SERVER_BASE="${WAP_SERVER_BASE:-}"
+
+# ---- WAP_PUSH_METHOD=nowsms ----
+# WAP_PUSH_BASE_URL: NowSMS HTTP endpoint for sending WAP Push SI messages
+export WAP_PUSH_BASE_URL="${WAP_PUSH_BASE_URL:-}"
+# WAP_PUSH_AUTH: HTTP Authorization header for NowSMS (Basic base64(user:pass))
+export WAP_PUSH_AUTH="${WAP_PUSH_AUTH:-}"
+
+# ---- WAP_PUSH_METHOD=kannel ----
+# WAP_PUSH_KANNEL_URL: Kannel wappush service URL (e.g. http://localhost:8080/wappush)
+export WAP_PUSH_KANNEL_URL="${WAP_PUSH_KANNEL_URL:-http://localhost:8080/wappush}"
+# WAP_PUSH_KANNEL_USERNAME / WAP_PUSH_KANNEL_PASSWORD: sent as ?username=&password=
+# query params (not a header). Leave both empty to send without auth.
+export WAP_PUSH_KANNEL_USERNAME="${WAP_PUSH_KANNEL_USERNAME:-}"
+export WAP_PUSH_KANNEL_PASSWORD="${WAP_PUSH_KANNEL_PASSWORD:-}"
+# WAP_PUSH_KANNEL_PPG: PPG domain used to build the WAPPUSH address (WAPPUSH=+<phone>/TYPE=PLMN@<domain>)
+export WAP_PUSH_KANNEL_PPG="${WAP_PUSH_KANNEL_PPG:-ppg.carrier.com}"
+# WAP_PUSH_KANNEL_SI_DOMAIN: domain used to build the SI si-id value (<id>@<domain>)
+export WAP_PUSH_KANNEL_SI_DOMAIN="${WAP_PUSH_KANNEL_SI_DOMAIN:-tuodominio.com}"
 
 # ---------- HTTPS / TLS ----------
 # Set HTTPS_ENABLED to true/1/yes/on to enable HTTPS with auto Let's Encrypt certificates.
@@ -105,10 +125,16 @@ echo "[env] HTTPS_EMAIL=$HTTPS_EMAIL"
 echo "[env] HTTPS_PORT=$HTTPS_PORT"
 echo "[env] HTTPS_CERTS_DIR=$HTTPS_CERTS_DIR"
 echo "[env] WAP_SERVER_BASE=$WAP_SERVER_BASE"
+echo "[env] WAP_PUSH_ENABLED=$WAP_PUSH_ENABLED"
+echo "[env] WAP_PUSH_METHOD=$WAP_PUSH_METHOD"
+echo "[env] WAP_PUSH_PHONE=$WAP_PUSH_PHONE"
+echo "[env] WAP_PUSH_MAX_SMS_PER_MONTH=${WAP_PUSH_MAX_SMS_PER_MONTH:-<unlimited>}"
 echo "[env] WAP_PUSH_BASE_URL=$WAP_PUSH_BASE_URL"
 echo "[env] WAP_PUSH_AUTH=$WAP_PUSH_AUTH"
-echo "[env] WAP_PUSH_ENABLED=$WAP_PUSH_ENABLED"
-echo "[env] WAP_PUSH_PHONE=$WAP_PUSH_PHONE"
+echo "[env] WAP_PUSH_KANNEL_URL=$WAP_PUSH_KANNEL_URL"
+echo "[env] WAP_PUSH_KANNEL_USERNAME=$WAP_PUSH_KANNEL_USERNAME"
+echo "[env] WAP_PUSH_KANNEL_PPG=$WAP_PUSH_KANNEL_PPG"
+echo "[env] WAP_PUSH_KANNEL_SI_DOMAIN=$WAP_PUSH_KANNEL_SI_DOMAIN"
 echo "[env] AUTH_ENABLED=$AUTH_ENABLED"
 echo "[env] MARKUP_MODE=${MARKUP_MODE:-<auto-detect per device>}"
 echo "[env] WA_PHONE_NUMBER=$WA_PHONE_NUMBER"

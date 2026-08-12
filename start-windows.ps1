@@ -32,27 +32,47 @@ if ([string]::IsNullOrWhiteSpace($env:AUTH_DB_PATH)) { $env:AUTH_DB_PATH = (Join
 # SESSION_DB_PATH: SQLite database for Express session storage
 if ([string]::IsNullOrWhiteSpace($env:SESSION_DB_PATH)) { $env:SESSION_DB_PATH = (Join-Path (Get-Location) "sessions.db") }
 
-# ---------- WAP Push / NowSMS Gateway ----------
+# ---------- WAP Push (NowSMS or Kannel) ----------
 # WAP Push sends real-time notifications to the phone when new WhatsApp messages arrive.
-# Requires a NowSMS gateway (or compatible WAP Push SI provider).
+# Two delivery methods are supported (WAP_PUSH_METHOD): "nowsms" (HTTP GET to a NowSMS
+# or compatible gateway) or "kannel" (multipart PAP push straight to a Kannel wappush service).
 #
-# NOTE: WAP_PUSH_ENABLED and WAP_PUSH_PHONE set the initial defaults only.
-# At runtime, all WAP Push options (enable/disable, expiration, auto-delete,
+# NOTE: WAP_PUSH_ENABLED, WAP_PUSH_METHOD and WAP_PUSH_PHONE set the initial defaults only.
+# At runtime, most WAP Push options (enable/disable, expiration, auto-delete,
 # history limit) are configurable from the Settings > WAP Push page.
 #
 # WAP_PUSH_ENABLED: initial default for WAP Push master switch (true/false/1/0/yes/no)
 if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_ENABLED)) { $env:WAP_PUSH_ENABLED = "true" }
-# WAP_PUSH_BASE_URL: NowSMS HTTP endpoint for sending WAP Push SI messages
-if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_BASE_URL)) { $env:WAP_PUSH_BASE_URL = "" }
-# WAP_PUSH_AUTH: HTTP Authorization header for NowSMS (Basic base64(user:pass))
-if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_AUTH)) { $env:WAP_PUSH_AUTH = "" }
+# WAP_PUSH_METHOD: "nowsms" (default) or "kannel"
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_METHOD)) { $env:WAP_PUSH_METHOD = "nowsms" }
 # WAP_PUSH_PHONE: initial phone number for WAP Push notifications (empty = disabled)
 # Can be changed at runtime from Settings > WAP Push
 if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_PHONE)) { $env:WAP_PUSH_PHONE = "" }
+# WAP_PUSH_MAX_SMS_PER_MONTH: caps WAP Push sends (notifications + auto-deletes) per
+# calendar month, across either delivery method. Empty/0 = unlimited.
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_MAX_SMS_PER_MONTH)) { $env:WAP_PUSH_MAX_SMS_PER_MONTH = "" }
 # WAP_SERVER_BASE: public URL of this server reachable from the phone's mobile network.
 # Used in WAP Push SI links so the phone can open the chat directly.
 # IMPORTANT: must NOT be 127.0.0.1 — the phone needs to reach this from the carrier network.
 if ([string]::IsNullOrWhiteSpace($env:WAP_SERVER_BASE)) { $env:WAP_SERVER_BASE = "" }
+
+# ---- WAP_PUSH_METHOD=nowsms ----
+# WAP_PUSH_BASE_URL: NowSMS HTTP endpoint for sending WAP Push SI messages
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_BASE_URL)) { $env:WAP_PUSH_BASE_URL = "" }
+# WAP_PUSH_AUTH: HTTP Authorization header for NowSMS (Basic base64(user:pass))
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_AUTH)) { $env:WAP_PUSH_AUTH = "" }
+
+# ---- WAP_PUSH_METHOD=kannel ----
+# WAP_PUSH_KANNEL_URL: Kannel wappush service URL (e.g. http://localhost:8080/wappush)
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_KANNEL_URL)) { $env:WAP_PUSH_KANNEL_URL = "http://localhost:8080/wappush" }
+# WAP_PUSH_KANNEL_USERNAME / WAP_PUSH_KANNEL_PASSWORD: sent as ?username=&password=
+# query params (not a header). Leave both empty to send without auth.
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_KANNEL_USERNAME)) { $env:WAP_PUSH_KANNEL_USERNAME = "" }
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_KANNEL_PASSWORD)) { $env:WAP_PUSH_KANNEL_PASSWORD = "" }
+# WAP_PUSH_KANNEL_PPG: PPG domain used to build the WAPPUSH address (WAPPUSH=+<phone>/TYPE=PLMN@<domain>)
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_KANNEL_PPG)) { $env:WAP_PUSH_KANNEL_PPG = "ppg.carrier.com" }
+# WAP_PUSH_KANNEL_SI_DOMAIN: domain used to build the SI si-id value (<id>@<domain>)
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_KANNEL_SI_DOMAIN)) { $env:WAP_PUSH_KANNEL_SI_DOMAIN = "tuodominio.com" }
 
 # ---------- HTTPS / TLS ----------
 # Set HTTPS_ENABLED to true/1/yes/on to enable HTTPS with auto Let's Encrypt certificates.
@@ -103,10 +123,16 @@ Write-Host "[env] HTTPS_EMAIL=$env:HTTPS_EMAIL"
 Write-Host "[env] HTTPS_PORT=$env:HTTPS_PORT"
 Write-Host "[env] HTTPS_CERTS_DIR=$env:HTTPS_CERTS_DIR"
 Write-Host "[env] WAP_SERVER_BASE=$env:WAP_SERVER_BASE"
+Write-Host "[env] WAP_PUSH_ENABLED=$env:WAP_PUSH_ENABLED"
+Write-Host "[env] WAP_PUSH_METHOD=$env:WAP_PUSH_METHOD"
+Write-Host "[env] WAP_PUSH_PHONE=$env:WAP_PUSH_PHONE"
+Write-Host "[env] WAP_PUSH_MAX_SMS_PER_MONTH=$(if ($env:WAP_PUSH_MAX_SMS_PER_MONTH) { $env:WAP_PUSH_MAX_SMS_PER_MONTH } else { '<unlimited>' })"
 Write-Host "[env] WAP_PUSH_BASE_URL=$env:WAP_PUSH_BASE_URL"
 Write-Host "[env] WAP_PUSH_AUTH=$env:WAP_PUSH_AUTH"
-Write-Host "[env] WAP_PUSH_ENABLED=$env:WAP_PUSH_ENABLED"
-Write-Host "[env] WAP_PUSH_PHONE=$env:WAP_PUSH_PHONE"
+Write-Host "[env] WAP_PUSH_KANNEL_URL=$env:WAP_PUSH_KANNEL_URL"
+Write-Host "[env] WAP_PUSH_KANNEL_USERNAME=$env:WAP_PUSH_KANNEL_USERNAME"
+Write-Host "[env] WAP_PUSH_KANNEL_PPG=$env:WAP_PUSH_KANNEL_PPG"
+Write-Host "[env] WAP_PUSH_KANNEL_SI_DOMAIN=$env:WAP_PUSH_KANNEL_SI_DOMAIN"
 Write-Host "[env] AUTH_ENABLED=$env:AUTH_ENABLED"
 Write-Host "[env] MARKUP_MODE=$(if ($env:MARKUP_MODE) { $env:MARKUP_MODE } else { '<auto-detect per device>' })"
 Write-Host "[env] WA_PHONE_NUMBER=$env:WA_PHONE_NUMBER"
