@@ -120,7 +120,8 @@ All configuration is done via environment variables. You can set them in a `.env
 | `WAP_PUSH_BASE_URL` | *(empty)* | NowSMS gateway URL for sending WAP Push SI (used when `WAP_PUSH_METHOD=nowsms`) |
 | `WAP_PUSH_AUTH` | *(empty)* | Authorization header for NowSMS (`Basic base64(user:pass)`) |
 | `WAP_PUSH_KANNEL_URL` | `http://localhost:8080/wappush` | Kannel wappush service URL (used when `WAP_PUSH_METHOD=kannel`) |
-| `WAP_PUSH_KANNEL_AUTH` | *(empty)* | Optional Basic Auth header for the Kannel wappush service |
+| `WAP_PUSH_KANNEL_USERNAME` | *(empty)* | Optional Kannel wappush username, sent as a `?username=` query param (not a header). Leave empty (with password) to send without auth |
+| `WAP_PUSH_KANNEL_PASSWORD` | *(empty)* | Optional Kannel wappush password, sent as a `?password=` query param |
 | `WAP_PUSH_KANNEL_PPG` | `ppg.carrier.com` | PPG domain used to build the `WAPPUSH=` PAP address |
 | `WAP_PUSH_KANNEL_SI_DOMAIN` | `tuodominio.com` | Domain used to build the SI `si-id` value (`<id>@<domain>`) |
 
@@ -253,7 +254,8 @@ When a new WhatsApp message arrives, the server can send a WAP Push SI (Service 
    WAP_PUSH_ENABLED=true
    WAP_PUSH_METHOD=kannel
    WAP_PUSH_KANNEL_URL=http://localhost:8080/wappush
-   WAP_PUSH_KANNEL_AUTH=Basic <base64-encoded-user:pass>   # if your Kannel push service requires auth
+   WAP_PUSH_KANNEL_USERNAME=david   # if your Kannel push service requires auth; leave both empty otherwise
+   WAP_PUSH_KANNEL_PASSWORD=david
    WAP_PUSH_KANNEL_PPG=ppg.carrier.com
    WAP_PUSH_KANNEL_SI_DOMAIN=your-domain.com
    WAP_PUSH_PHONE=your-phone-number

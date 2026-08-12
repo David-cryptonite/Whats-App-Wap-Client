@@ -1513,7 +1513,18 @@ async function sendWAPPushViaKannel({ phoneNumber, text, href, siId, action, cre
   if (!KANNEL_URL) { logger.warn('WAP_PUSH_KANNEL_URL not configured — skipping Kannel WAP Push'); return { success: false }; }
   const ppgDomain = process.env.WAP_PUSH_KANNEL_PPG || 'ppg.carrier.com';
   const siDomain = process.env.WAP_PUSH_KANNEL_SI_DOMAIN || 'localhost';
-  const AUTH = process.env.WAP_PUSH_KANNEL_AUTH || '';
+
+  // Kannel's wappush service authenticates via ?username=&password= query params, not a header.
+  // Omit both when unset so the request goes out without auth.
+  const kannelUsername = process.env.WAP_PUSH_KANNEL_USERNAME || '';
+  const kannelPassword = process.env.WAP_PUSH_KANNEL_PASSWORD || '';
+  let requestUrl = KANNEL_URL;
+  if (kannelUsername || kannelPassword) {
+    const authParams = new URLSearchParams();
+    if (kannelUsername) authParams.set('username', kannelUsername);
+    if (kannelPassword) authParams.set('password', kannelPassword);
+    requestUrl += (KANNEL_URL.includes('?') ? '&' : '?') + authParams.toString();
+  }
 
   const pushId = `${siId}-${Date.now().toString(36)}`;
   const siXml = buildWapSiXml({ href, text, siId: `${siId}@${siDomain}`, action, created, expires });
@@ -1534,10 +1545,9 @@ async function sendWAPPushViaKannel({ phoneNumber, text, href, siId, action, cre
   ].join('');
 
   try {
-    const response = await axios.post(KANNEL_URL, body, {
+    const response = await axios.post(requestUrl, body, {
       headers: {
-        'Content-Type': `multipart/related; boundary=${boundary}; type="application/xml"; start="<control>"`,
-        ...(AUTH ? { 'Authorization': AUTH } : {})
+        'Content-Type': `multipart/related; boundary=${boundary}; type="application/xml"; start="<control>"`
       },
       timeout: 10000
     });
