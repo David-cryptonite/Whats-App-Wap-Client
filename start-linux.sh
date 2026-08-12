@@ -49,6 +49,9 @@ export WAP_PUSH_METHOD="${WAP_PUSH_METHOD:-nowsms}"
 # WAP_PUSH_PHONE: initial phone number for WAP Push notifications (empty = disabled)
 # Can be changed at runtime from Settings > WAP Push
 export WAP_PUSH_PHONE="${WAP_PUSH_PHONE:-}"
+# WAP_PUSH_EXPIRE_MINUTES: initial default for how many minutes before a WAP Push SI
+# notification expires. Can be changed at runtime from Settings > WAP Push.
+export WAP_PUSH_EXPIRE_MINUTES="${WAP_PUSH_EXPIRE_MINUTES:-2}"
 # WAP_PUSH_MAX_SMS_PER_MONTH: caps WAP Push sends (notifications + auto-deletes) per
 # calendar month, across either delivery method. Empty/0 = unlimited.
 export WAP_PUSH_MAX_SMS_PER_MONTH="${WAP_PUSH_MAX_SMS_PER_MONTH:-}"
@@ -128,6 +131,7 @@ echo "[env] WAP_SERVER_BASE=$WAP_SERVER_BASE"
 echo "[env] WAP_PUSH_ENABLED=$WAP_PUSH_ENABLED"
 echo "[env] WAP_PUSH_METHOD=$WAP_PUSH_METHOD"
 echo "[env] WAP_PUSH_PHONE=$WAP_PUSH_PHONE"
+echo "[env] WAP_PUSH_EXPIRE_MINUTES=$WAP_PUSH_EXPIRE_MINUTES"
 echo "[env] WAP_PUSH_MAX_SMS_PER_MONTH=${WAP_PUSH_MAX_SMS_PER_MONTH:-<unlimited>}"
 echo "[env] WAP_PUSH_BASE_URL=$WAP_PUSH_BASE_URL"
 echo "[env] WAP_PUSH_AUTH=$WAP_PUSH_AUTH"

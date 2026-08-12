@@ -115,6 +115,7 @@ All configuration is done via environment variables. You can set them in a `.env
 | `WAP_PUSH_ENABLED` | `true` | Initial default for WAP Push master switch |
 | `WAP_PUSH_METHOD` | `nowsms` | Delivery method: `nowsms` (HTTP GET to a NowSMS-compatible gateway) or `kannel` (multipart PAP push straight to Kannel) |
 | `WAP_PUSH_PHONE` | *(empty)* | Initial phone number for WAP Push notifications |
+| `WAP_PUSH_EXPIRE_MINUTES` | `2` | Initial default for how many minutes before a WAP Push SI notification expires (only while expiration is enabled in Settings > WAP Push) |
 | `WAP_PUSH_MAX_SMS_PER_MONTH` | *(empty = unlimited)* | Caps WAP Push sends (notifications + auto-deletes) per calendar month; further sends are skipped once reached, counter resets next month |
 | `WAP_SERVER_BASE` | *(empty)* | Public URL of this server reachable from the phone's mobile network. **Must not be 127.0.0.1** |
 | `WAP_PUSH_BASE_URL` | *(empty)* | NowSMS gateway URL for sending WAP Push SI (used when `WAP_PUSH_METHOD=nowsms`) |

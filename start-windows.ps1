@@ -48,6 +48,9 @@ if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_METHOD)) { $env:WAP_PUSH_METHOD =
 # WAP_PUSH_PHONE: initial phone number for WAP Push notifications (empty = disabled)
 # Can be changed at runtime from Settings > WAP Push
 if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_PHONE)) { $env:WAP_PUSH_PHONE = "" }
+# WAP_PUSH_EXPIRE_MINUTES: initial default for how many minutes before a WAP Push SI
+# notification expires. Can be changed at runtime from Settings > WAP Push.
+if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_EXPIRE_MINUTES)) { $env:WAP_PUSH_EXPIRE_MINUTES = "2" }
 # WAP_PUSH_MAX_SMS_PER_MONTH: caps WAP Push sends (notifications + auto-deletes) per
 # calendar month, across either delivery method. Empty/0 = unlimited.
 if ([string]::IsNullOrWhiteSpace($env:WAP_PUSH_MAX_SMS_PER_MONTH)) { $env:WAP_PUSH_MAX_SMS_PER_MONTH = "" }
@@ -126,6 +129,7 @@ Write-Host "[env] WAP_SERVER_BASE=$env:WAP_SERVER_BASE"
 Write-Host "[env] WAP_PUSH_ENABLED=$env:WAP_PUSH_ENABLED"
 Write-Host "[env] WAP_PUSH_METHOD=$env:WAP_PUSH_METHOD"
 Write-Host "[env] WAP_PUSH_PHONE=$env:WAP_PUSH_PHONE"
+Write-Host "[env] WAP_PUSH_EXPIRE_MINUTES=$env:WAP_PUSH_EXPIRE_MINUTES"
 Write-Host "[env] WAP_PUSH_MAX_SMS_PER_MONTH=$(if ($env:WAP_PUSH_MAX_SMS_PER_MONTH) { $env:WAP_PUSH_MAX_SMS_PER_MONTH } else { '<unlimited>' })"
 Write-Host "[env] WAP_PUSH_BASE_URL=$env:WAP_PUSH_BASE_URL"
 Write-Host "[env] WAP_PUSH_AUTH=$env:WAP_PUSH_AUTH"

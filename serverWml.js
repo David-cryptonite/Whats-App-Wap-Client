@@ -2773,7 +2773,10 @@ let userSettings = {
   ...(process.env.WAP_PUSH_ENABLED !== undefined
     ? { wapPushEnabled: !['0', 'false', 'no', 'off'].includes(process.env.WAP_PUSH_ENABLED.toLowerCase()) }
     : {}),
-  ...(process.env.WAP_PUSH_METHOD ? { wapPushMethod: process.env.WAP_PUSH_METHOD.toLowerCase() === 'kannel' ? 'kannel' : 'nowsms' } : {})
+  ...(process.env.WAP_PUSH_METHOD ? { wapPushMethod: process.env.WAP_PUSH_METHOD.toLowerCase() === 'kannel' ? 'kannel' : 'nowsms' } : {}),
+  ...(process.env.WAP_PUSH_EXPIRE_MINUTES && Number.parseFloat(process.env.WAP_PUSH_EXPIRE_MINUTES) > 0
+    ? { wapPushExpireMs: Math.round(Number.parseFloat(process.env.WAP_PUSH_EXPIRE_MINUTES) * 60000) }
+    : {})
 };
 
 // ============ I18N / TRANSLATIONS ============
